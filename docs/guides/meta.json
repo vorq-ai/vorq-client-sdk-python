@@ -1,0 +1,11 @@
+{
+  "title": "Guides",
+  "pages": [
+    "generate-images-and-video",
+    "submit-a-batch",
+    "persist-and-resume-jobs",
+    "use-the-openai-client",
+    "cancel-a-job",
+    "manage-keys-and-sessions"
+  ]
+}

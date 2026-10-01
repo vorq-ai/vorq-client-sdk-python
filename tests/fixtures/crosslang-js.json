@@ -1,0 +1,13 @@
+{
+  "generated_by": "vorq-client-sdk-js/scripts/gen-crosslang.mjs",
+  "why": "the vectors pin the wrap as an opaque blob; this fixture carries the recipient's private key, so opening it proves the sealed box is libsodium's and that the sealed 32 bytes are the seed",
+  "recipient_secret_key": "2222222222222222222222222222222222222222222222222222222222222222",
+  "recipient_public_key": "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20",
+  "owner": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+  "seed": "fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedecebeae9e8e7e6e5e4e3e2e1e0",
+  "dek": "1de83bd85b49cf80bb0e4b72720b6141098a92e12cc049864a707f72ba06fff8",
+  "plaintext": "{\"v\":\"vorq-env-v1\",\"input\":\"js to python\"}",
+  "container": "0x011a08234ee5ed9f1b69139583841e81523da594c7285a976e5a6f4ef94fa34c5998ed509bab27938fec98e59e4a97797618075164ef516018ff3e31ac1b09cc87dda928b572926d3171bcf19c1ed3c85e473961b0219b086e749240ea78bc1d6a02af4a5987771a52b65c1dfdf3f3d28e5e518e6a0e1c65cd13a9263bbfcd375fd042a945a2616dca13237438b1c5b3f344a8ceeac6be17a6b245b9d839b2898b0f11",
+  "c": "0xefda75785ab67d96999cd56e73720c5706743588ea55e4977d972e92daf6d8de",
+  "job_id": "0x977b2a7a0ab14c921df0aeb4933ea431e4cad7c9085f2b0bc5c5673fc10a49b2"
+}
