@@ -1,0 +1,15 @@
+{
+  "title": "Reference",
+  "pages": [
+    "client",
+    "job-handle",
+    "results",
+    "batches",
+    "units",
+    "openai-transport",
+    "errors",
+    "signing",
+    "verifier",
+    "environment-variables"
+  ]
+}

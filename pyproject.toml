@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vorq"
+version = "0.1.0rc1"
+description = "Python client for the VORQ inference exchange"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "eth-account>=0.13",
+    # keccak, for the job id and the container digest. Ships with eth-account;
+    # named here because this package imports it itself.
+    "eth-utils>=4.0",
+    "pynacl>=1.5",
+    "jsonschema>=4.21",
+]
+
+[project.urls]
+Homepage = "https://vorq.co"
+Documentation = "https://docs.vorq.co/docs/python"
+Repository = "https://github.com/vorq-ai/vorq-client-sdk-python"
+Changelog = "https://github.com/vorq-ai/vorq-client-sdk-python/blob/main/CHANGELOG.md"
+
+[dependency-groups]
+# PEP 735. Install with `pip install -e . --group dev` (pip >= 25.1). Hatchling
+# does not surface a dependency-group as an extra, so `pip install -e '.[dev]'`
+# only warns "does not provide the extra 'dev'" and exits 0 having installed
+# nothing — the failure then surfaces as an ImportError under pytest.
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "mypy>=1.8",
+    # Not a runtime dependency: sealing_http_client is an httpx.Client, and the
+    # package that consumes it is the caller's. Present in dev so the compat
+    # tests can drive the real thing — the transport's contract is with that
+    # package's URL building and response parsing, which a hand-rolled request
+    # does not exercise.
+    "openai>=1.60",
+]
+
+[tool.mypy]
+files = ["vorq"]
+python_version = "3.11"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vorq"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/vorq", "/README.md", "/CHANGELOG.md", "/LICENSE"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
