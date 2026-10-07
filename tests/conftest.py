@@ -109,6 +109,25 @@ def no_sleep(monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", _instant)
 
 
+@pytest.fixture
+def wait_clock(monkeypatch):
+    """A stopped clock that only a poll sleep advances; returns the sleeps taken."""
+    import asyncio
+
+    from vorq import _sla
+
+    clock = {"now": 0.0}
+    sleeps: list[float] = []
+
+    async def _advance(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(_sla, "now", lambda: clock["now"])
+    monkeypatch.setattr(asyncio, "sleep", _advance)
+    return sleeps
+
+
 def json_keys(obj) -> set[str]:
     """Every key name appearing anywhere in a nested JSON structure.
 

@@ -83,4 +83,6 @@ for h in handles:
 results = await asyncio.gather(*[h.result() for h in handles])
 ```
 
-Each waiting job costs one `GET` per poll interval, which is once a minute on both tiers.
+Each waiting job costs one `GET` per poll interval: once a minute at first, and on the `24h`
+tier every 3 minutes after 15 minutes of waiting and every 10 minutes after an hour. A batch
+costs one `GET` per interval for all of its lines.

@@ -31,7 +31,8 @@ from ._results import (
     TextResult,
     result_from_batch_line,
 )
-from ._sla import normalize_sla, poll_interval, sla_seconds
+from . import _sla
+from ._sla import batch_poll_interval, normalize_sla, sla_seconds
 from .errors import BatchFailed, ValidationError, VorqError, WaitTimeout
 
 if TYPE_CHECKING:
@@ -529,13 +530,15 @@ class BatchHandle:
         window = self._completion_window or "24h"
         if timeout is None:
             timeout = sla_seconds(window)
-        interval = poll_interval(window)
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+        start = _sla.now()
+        deadline = start + timeout
         tasks: list[asyncio.Task] = []
 
+        # One read of the batch per tick, whatever its line count: the lines are
+        # never polled one by one.
         while batch["status"] not in _TERMINAL:
-            remaining = deadline - loop.time()
+            now = _sla.now()
+            remaining = deadline - now
             if remaining <= 0:
                 raise WaitTimeout(
                     f"Batch {self.id} did not settle within {timeout}s. Nothing was "
@@ -543,7 +546,7 @@ class BatchHandle:
                     "with client.batches.get(...).",
                     job_id=self.id,
                 )
-            await asyncio.sleep(min(interval, remaining))
+            await asyncio.sleep(min(batch_poll_interval(now - start), remaining))
             batch = await self._fetch()
 
         if batch["status"] == "failed":

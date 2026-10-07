@@ -1,4 +1,5 @@
-from vorq._sla import MAX_POLL_INTERVAL_SECONDS, normalize_sla, sla_seconds, poll_interval
+import pytest
+from vorq._sla import batch_poll_interval, normalize_sla, poll_interval, sla_seconds
 
 
 class TestNormalizeSla:
@@ -31,24 +32,27 @@ class TestSlaSeconds:
 
 class TestPollInterval:
     def test_async_tier_polls_once_a_minute(self):
-        assert poll_interval("1h") == 60.0
-
-    def test_the_batch_tier_is_capped_at_the_same_minute(self):
-        # Was 1440.0 — twenty-four minutes between reads. `result()`'s default
-        # timeout is the job's own SLA and the loop sleeps before it re-reads, so
-        # the last sleep could eat the remaining budget and raise WaitTimeout on
-        # a job that had already settled.
-        assert poll_interval("24h") == MAX_POLL_INTERVAL_SECONDS
-
-    def test_a_window_longer_than_a_day_is_capped_too(self):
-        # Unknown windows pass through `sla_seconds` verbatim (a governance-added
-        # window needs no SDK update), so the cap has to bound the formula rather
-        # than the two windows this SDK happens to name today.
-        assert poll_interval("168h") == MAX_POLL_INTERVAL_SECONDS
+        assert poll_interval("1h", 0) == 60.0
+        assert poll_interval("1h", 3599) == 60.0
 
     def test_windows_between_the_floor_and_the_cap_still_pace_by_sla(self):
-        assert poll_interval("30m") == 30.0
-        assert poll_interval("10m") == 10.0
+        assert poll_interval("30m", 0) == 30.0
+        assert poll_interval("10m", 0) == 10.0
 
     def test_floors_at_two_seconds(self):
-        assert poll_interval("45s") == 2.0
+        assert poll_interval("45s", 0) == 2.0
+
+    @pytest.mark.parametrize("elapsed, interval", [
+        (0, 60.0), (899, 60.0), (900, 180.0), (3599, 180.0), (3600, 600.0), (86399, 600.0),
+    ])
+    def test_the_batch_schedule_steps_at_fifteen_minutes_and_one_hour(self, elapsed, interval):
+        assert batch_poll_interval(elapsed) == interval
+
+    @pytest.mark.parametrize("window", ["24h", "batch", "168h"])
+    def test_a_window_of_a_day_or_longer_follows_the_batch_schedule(self, window):
+        # Unknown windows pass through `sla_seconds` verbatim (a governance-added
+        # window needs no SDK update), so the rule is the duration and not the
+        # two windows this SDK happens to name today.
+        assert poll_interval(window, 0) == 60.0
+        assert poll_interval(window, 900) == 180.0
+        assert poll_interval(window, 3600) == 600.0

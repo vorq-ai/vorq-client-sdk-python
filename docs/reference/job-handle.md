@@ -40,7 +40,7 @@ Polls until the job is terminal, then returns its result:
 
 | Behavior | Value |
 | --- | --- |
-| Poll interval | The SLA window ÷ 60, held between 2 and 60 seconds. |
+| Poll interval | Windows under 24 hours: the window ÷ 60, held between 2 and 60 seconds. `24h`: 60 seconds for the first 15 minutes of the wait, 180 seconds until the first hour is up, 600 seconds after. |
 | SLA window | Known from `submit`. A re-attached handle reads it from the job, and assumes `1h` if the job states none. |
 | Default `timeout` | The SLA window. Pass `timeout=` explicitly when re-attaching to a longer job. |
 | On timeout | Raises `WaitTimeout` with `.job_id`. Nothing is cancelled; call `result()` again. |

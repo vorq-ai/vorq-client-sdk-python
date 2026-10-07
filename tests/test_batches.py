@@ -16,7 +16,7 @@ import pytest
 from vorq._crypto import SealedBoxCipher, WalletSigner
 from vorq._money import parse_usd
 from vorq._results import JobError, TextResult
-from vorq.errors import BatchFailed, ValidationError, VorqError
+from vorq.errors import BatchFailed, ValidationError, VorqError, WaitTimeout
 
 from .conftest import fake_cid, json_keys, json_response, make_client
 from .test_client import BOX_PUBLIC, _open_complete, auth_router, quote_body
@@ -509,6 +509,52 @@ class TestSubmit:
 # ---------------------------------------------------------------------------
 # Reading it back
 # ---------------------------------------------------------------------------
+
+
+@needs_wallet
+class TestWaiting:
+    async def test_a_batch_is_polled_on_the_stepped_schedule_with_one_read_a_tick(self, wait_clock):
+        """Once a minute for 15 min, every 3 min to the hour, every 10 min after.
+
+        And the read is the batch's own, once per tick: a batch of thousands of
+        lines costs what a batch of one does, never a request per job.
+        """
+        seen: list[str] = []
+        waiting = batch_object(status="in_progress", output_file_id=None,
+                               request_counts={"completed": 0, "failed": 0, "total": 5000})
+
+        def handler(request):
+            seen.append(f"{request.method} {request.url.path}")
+            return json_response(200, waiting)
+
+        client = _sealing_client(auth_router(handler))
+        handle = client.batches.get("batch_1")
+        handle.job_ids = [f"0x{n:064x}" for n in range(5000)]
+        with pytest.raises(WaitTimeout):
+            await handle.results()
+
+        assert wait_clock == [60.0] * 15 + [180.0] * 15 + [600.0] * 138
+        reads = [call for call in seen if "/v1/" in call]
+        assert reads == ["GET /v1/batches/batch_1"] * (len(wait_clock) + 1)
+        await client.aclose()
+
+    async def test_a_1h_batch_follows_the_same_schedule(self, wait_clock):
+        state = {}
+        client = _sealing_client(batch_router(
+            state, batch=batch_object(status="in_progress", completion_window="1h")))
+        with pytest.raises(WaitTimeout):
+            await client.batches.get("batch_1").results()
+        assert wait_clock == [60.0] * 15 + [180.0] * 15
+        assert state["polls"] == 31
+        await client.aclose()
+
+    async def test_a_sleep_never_runs_past_the_timeout(self, wait_clock):
+        state = {}
+        client = _sealing_client(batch_router(state, batch=batch_object(status="in_progress")))
+        with pytest.raises(WaitTimeout):
+            await client.batches.get("batch_1").results(timeout=100)
+        assert wait_clock == [60.0, 40.0]
+        await client.aclose()
 
 
 @needs_wallet

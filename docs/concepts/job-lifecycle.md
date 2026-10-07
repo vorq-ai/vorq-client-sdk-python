@@ -51,9 +51,11 @@ Branch on the end cause, not the status: two different facts share each non-`com
 
 ## Waiting
 
-`handle.result()` polls the coordinator at the SLA window divided by 60, held between 2 and 60
-seconds, so both tiers poll once a minute. By default it waits for the job's whole window, then
-raises `WaitTimeout`. Timing out cancels nothing.
+`handle.result()` polls the coordinator. A `1h` job is read once a minute. A `24h` job is read
+once a minute for the first 15 minutes of the wait, every 3 minutes for the rest of the first
+hour, and every 10 minutes after that. A batch waits on the same schedule as a `24h` job, with
+one read of the batch per poll whatever its line count. By default the wait lasts the job's
+whole window, then raises `WaitTimeout`. Timing out cancels nothing.
 
 ## Jobs are durable, handles are not
 

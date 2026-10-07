@@ -4,6 +4,14 @@ All notable changes to the `vorq` package are documented here. The format follow
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.0rc3] — 2026-10-07
+
+### Changed
+
+- Waiting on a batch, or on a single `24h` job, now polls once a minute for the first 15
+  minutes of the wait, every 3 minutes for the rest of the first hour, and every 10 minutes
+  after that. It used to poll once a minute throughout. Windows under 24 hours are unchanged.
+
 ## [0.1.0rc2] — 2026-10-07
 
 ### Changed

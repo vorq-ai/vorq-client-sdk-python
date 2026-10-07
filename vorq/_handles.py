@@ -11,6 +11,7 @@ import time
 from typing import TYPE_CHECKING, Union
 
 from ._results import EmbeddingResult, MediaResult, TextResult, result_from_raw
+from . import _sla
 from ._sla import poll_interval, sla_seconds, window_from_seconds
 from .errors import JobFailed, ResultIntegrityError, ValidationError, WaitTimeout
 
@@ -100,10 +101,12 @@ class JobHandle:
     async def result(self, timeout: float | None = None) -> Union[TextResult, MediaResult, EmbeddingResult]:
         """Poll until terminal, then return the result (or raise ``JobFailed``).
 
-        Paced by the job's SLA — ``sla_seconds/60``, held between 2 s and
-        :data:`~vorq._sla.MAX_POLL_INTERVAL_SECONDS` (60 s). The upper bound is
-        what stops a ``"24h"`` job being read once every twenty-four minutes,
-        which put the last sleep of the loop past the deadline below.
+        A window shorter than a day is paced by the window — ``sla_seconds/60``,
+        held between 2 s and :data:`~vorq._sla.MAX_POLL_INTERVAL_SECONDS` (60 s).
+        A ``"24h"`` job is paced by time spent waiting: once a minute for the
+        first fifteen minutes, every three minutes for the rest of the first
+        hour, every ten minutes after it. Every sleep is clamped to what is left
+        of ``timeout``.
         ``timeout`` defaults to the job's SLA; on expiry raises
         :class:`~vorq.errors.WaitTimeout` carrying ``.job_id``.
         """
@@ -111,16 +114,16 @@ class JobHandle:
         sla = self._sla or "1h"
         if timeout is None:
             timeout = sla_seconds(sla)
-        interval = poll_interval(sla)
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+        start = _sla.now()
+        deadline = start + timeout
         while job["status"] not in _TERMINAL:
-            remaining = deadline - loop.time()
+            now = _sla.now()
+            remaining = deadline - now
             if remaining <= 0:
                 raise WaitTimeout(
                     f"Job {self.id} did not settle within {timeout}s.", job_id=self.id
                 )
-            await asyncio.sleep(min(interval, remaining))
+            await asyncio.sleep(min(poll_interval(sla, now - start), remaining))
             job = await self._fetch()
         if job["status"] == "completed":
             return await self._settled_result(job)

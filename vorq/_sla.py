@@ -8,6 +8,8 @@ network-added window needs no SDK update.
 
 from __future__ import annotations
 
+import time
+
 _TIER_ALIASES = {"async": "1h", "batch": "24h"}
 _UNIT_SECONDS = {"h": 3600, "m": 60, "s": 1}
 
@@ -33,26 +35,50 @@ def sla_seconds(window: str) -> int:
     return 3600
 
 
-#: The longest this SDK will wait between two reads of one job.
+#: The longest a window shorter than a day waits between two reads of one job.
 #:
-#: Sixty seconds, and the number is not new: it is exactly what the ``"1h"``
-#: window has always polled at (``3600 / 60``). The cap therefore introduces no
-#: pacing — it stops a **longer** window from being polled **more slowly** than
-#: the fast one, which is what ``sla_seconds / 60`` unbounded actually did: a
-#: ``"24h"`` job slept 1440 s, so a job settling one second after a read was
-#: reported settled twenty-four minutes later. ``result()``'s default timeout is
-#: the job's own SLA and the loop sleeps before it re-reads, so that last sleep
-#: could consume the remaining budget and raise ``WaitTimeout`` on a job that
-#: had finished well inside its window.
-#:
-#: The cost of the cap is request volume and it is small: at most 1440 reads of
-#: ``GET /v1/jobs/{id}`` over a whole day, which is the same total the ``"1h"``
-#: window already spends in an hour.
+#: Sixty seconds, which is exactly what the ``"1h"`` window polls at
+#: (``3600 / 60``); shorter windows poll faster, down to two seconds.
 MAX_POLL_INTERVAL_SECONDS = 60.0
 
+#: The long-wait schedule: ``(waited less than, interval)`` in seconds, read top
+#: down, and the last interval once every bound is passed. Once a minute for the
+#: first fifteen minutes, every three minutes for the rest of the first hour,
+#: every ten minutes after it.
+#:
+#: Stepped by time spent waiting, never by the window: work that has not come
+#: back in an hour is not about to, and a day of once-a-minute reads is 1440
+#: requests where this spends 168. The loops clamp every sleep to what is left
+#: of the timeout, so a long interval never sleeps past the deadline.
+BATCH_POLL_SCHEDULE = ((900.0, 60.0), (3600.0, 180.0))
+BATCH_POLL_INTERVAL_SECONDS = 600.0
 
-def poll_interval(window: str) -> float:
-    """SLA-paced poll interval, held in ``[2, MAX_POLL_INTERVAL_SECONDS]`` seconds."""
+#: Windows this long are paced by the schedule above rather than by the window.
+_SCHEDULED_WINDOW_SECONDS = 86400
+
+
+def now() -> float:
+    """The monotonic clock both wait loops read, in seconds."""
+    return time.monotonic()
+
+
+def batch_poll_interval(elapsed: float) -> float:
+    """Poll interval ``elapsed`` seconds into a wait, per :data:`BATCH_POLL_SCHEDULE`."""
+    for bound, interval in BATCH_POLL_SCHEDULE:
+        if elapsed < bound:
+            return interval
+    return BATCH_POLL_INTERVAL_SECONDS
+
+
+def poll_interval(window: str, elapsed: float) -> float:
+    """Poll interval for one job, ``elapsed`` seconds into the wait.
+
+    A window of a day or longer follows :func:`batch_poll_interval`. A shorter
+    one is paced by the window — ``sla_seconds / 60``, held in
+    ``[2, MAX_POLL_INTERVAL_SECONDS]`` seconds.
+    """
+    if sla_seconds(window) >= _SCHEDULED_WINDOW_SECONDS:
+        return batch_poll_interval(elapsed)
     return min(max(sla_seconds(window) / 60, 2.0), MAX_POLL_INTERVAL_SECONDS)
 
 

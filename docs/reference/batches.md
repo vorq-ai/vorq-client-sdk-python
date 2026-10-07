@@ -84,6 +84,9 @@ await batch.cancel() -> None
 - Terminal statuses are `completed`, `failed`, `expired` and `cancelled`.
 - Results arrive in file order (every settled line, then every failed one), not input order.
   Match on `.custom_id`, or on `.job_id` against `job_ids`.
+- Waiting polls once a minute for the first 15 minutes, every 3 minutes for the rest of the
+  first hour, and every 10 minutes after that. Each poll is one `GET /v1/batches/{id}`, whatever
+  the line count.
 - The default timeout is the batch's completion window. On expiry they raise `WaitTimeout`,
   whose `.job_id` is the batch id.
 - A batch that ends `failed` had its input file refused, and raises `BatchFailed` with

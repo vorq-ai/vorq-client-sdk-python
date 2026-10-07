@@ -1936,6 +1936,27 @@ class TestJobHandle:
         assert exc.value.job_id == "job_txt"
         await client.aclose()
 
+    async def test_a_24h_job_is_polled_on_the_stepped_schedule(self, wait_clock):
+        """Once a minute for 15 min, every 3 min to the hour, every 10 min after."""
+        def handler(request):
+            return json_response(200, queued_job(sla="24h"))
+
+        client = make_client(handler)
+        with pytest.raises(WaitTimeout):
+            await client.job("job_txt").result()
+        assert wait_clock == [60.0] * 15 + [180.0] * 15 + [600.0] * 138
+        await client.aclose()
+
+    async def test_a_1h_job_is_polled_once_a_minute_throughout(self, wait_clock):
+        def handler(request):
+            return json_response(200, queued_job(sla="1h"))
+
+        client = make_client(handler)
+        with pytest.raises(WaitTimeout):
+            await client.job("job_txt").result()
+        assert wait_clock == [60.0] * 60
+        await client.aclose()
+
     async def test_result_polls_until_terminal(self, no_sleep):
         calls = {"n": 0}
 
@@ -2342,9 +2363,9 @@ class TestTheNodesOwnJobShape:
         await handle.status()
         assert handle._sla == "24h"
         assert sla_seconds(handle._sla) == 86400
-        # Capped: a re-attached 24 h job is read once a minute, not once every
-        # twenty-four (`vorq._sla.MAX_POLL_INTERVAL_SECONDS`).
-        assert poll_interval(handle._sla) == 60.0
+        # A re-attached 24 h job is paced by the long-wait schedule.
+        assert poll_interval(handle._sla, 0) == 60.0
+        assert poll_interval(handle._sla, 3600) == 600.0
         await client.aclose()
 
     @pytest.mark.parametrize("ended_because, status, cause", [
