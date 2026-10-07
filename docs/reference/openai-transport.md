@@ -26,7 +26,7 @@ Returns an `httpx.Client` for `openai.OpenAI(http_client=...)`, whose transport 
 | --- | --- |
 | `base_url` | The bare coordinator origin, without `/v1`. The `openai.OpenAI(base_url=...)` you pair it with needs the `/v1` suffix. |
 | `signer`, `cipher` | As on [`vorq.Client`](./client.md#constructor). By default the wallet comes from `VORQ_WALLET_KEY` and the result cipher is derived from it. |
-| `verifier` | Needed for open orders: a bid named in the `vorq` block with no provider. |
+| `verifier` | Needed for open orders: a ceiling named in the `vorq` block that no provider is within, with no provider pinned. |
 | `timeout` | Per-request connect timeout, as on `vorq.Client`. |
 | `inner_transport` | An `httpx` async transport for the native client underneath, for example a test double. |
 
@@ -54,8 +54,8 @@ The `vorq` block (sent through `extra_body={"vorq": {...}}`):
 | Key | Meaning |
 | --- | --- |
 | `sla` | The completion window. Default `"1h"`. |
-| `rate_in` | Your input-side bid in USD per 1M units, a decimal string such as `"0.05"`. With neither rate, the order takes the [market](../concepts/bids-and-matching.md#no-bid-named); with only one, the other side is zero. |
-| `rate_out` | Your output-side bid, same unit. |
+| `max_rate_in` | The most the order pays for the input side, in USD per 1M units, a decimal string such as `"0.05"`. Optional: a side with no ceiling pays the provider's ask. See [Bids and matching](../concepts/bids-and-matching.md#how-an-order-is-matched). |
+| `max_rate_out` | The most it pays for the output side, same unit. |
 | `provider` | A provider id to pin. |
 
 Other keys in the block are ignored.

@@ -49,7 +49,7 @@ def test_a_caller_amount_that_is_not_str_or_decimal_is_refused_naming_the_unit(v
 def test_a_decimal_caller_amount_converts_exactly():
     assert usd_atomic(Decimal("0.05"), "rate_in", 6) == 50_000
     assert usd_atomic(Decimal("1E+2"), "rate_in", 6) == 100_000_000
-    assert usd_atomic(None, "rate_in", 6) == 0
+    assert usd_atomic(None, "rate_in", 6) is None
 
 
 def test_a_caller_amount_finer_than_the_token_is_refused_not_rounded():

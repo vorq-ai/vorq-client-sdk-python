@@ -19,9 +19,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+from itertools import islice
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Union
 
-from ._money import usd_arg, usd_atomic, wire_atomic
+from ._money import format_usd, usd_arg, usd_atomic, wire_atomic
 from ._params import check_input
 from ._results import (
     EmbeddingResult,
@@ -74,6 +75,10 @@ def _endpoint_of(line: dict, n: int) -> str:
     return url
 
 
+#: What lines are planned together by: the model and the two atomic ceilings.
+_Key = tuple[str, Union[int, None], Union[int, None]]
+
+
 class Batches:
     """``client.batches`` — submit a sealed batch, or re-attach to one."""
 
@@ -96,22 +101,26 @@ class Batches:
         file. Every line is sealed to its recipient inside this process; nothing
         leaves it in the clear.
 
-        A line's ``rate_in`` / ``rate_out`` are its bid in USD per 1M units of work,
-        a ``str`` or ``Decimal`` (``"0.05"``); an ``int`` or ``float`` is refused.
-        A line that names neither takes the market:
-        before anything is sealed, the coordinator plans who takes each such line
-        and at which ask, never past a provider's on-chain capacity, and the line
-        is pinned to that provider. A batch the network cannot take in full in its
-        window raises :class:`~vorq.errors.ValidationError` with nothing signed.
+        A line's ``max_rate_in`` / ``max_rate_out`` are the most it pays, in USD
+        per 1M units of work, a ``str`` or ``Decimal`` (``"0.05"``); an ``int`` or
+        ``float`` is refused. Each is optional and a side left out has no ceiling.
+        Before anything is sealed, the coordinator plans who takes each line
+        within its ceilings and at which ask, never past a provider's on-chain
+        capacity; a planned line signs that provider's ask and is pinned to it.
+        A line the plan cannot place **rests** at its ceilings, a side with no
+        ceiling at the market rate (the cheapest live ask's). A line with no
+        ceiling at all has nothing to rest at, so a batch whose such lines the
+        network cannot take in full raises
+        :class:`~vorq.errors.ValidationError` with nothing signed.
 
-        ``providers`` is how a batch of priced lines spreads. Given a list, lines are designated
+        ``providers`` is how the resting lines spread. Given a list, they are designated
         round-robin across it — one batch running across several operators, each
-        able to open only its own lines. Given nothing, every line is an **open
+        able to open only its own lines. Given nothing, each is an **open
         order**: sealed to the coordinator's verified escrow key and claimable by
         any provider that clears the terms, which spreads further than a fixed
-        list can and needs no candidate ranking. That path requires a client built
-        with ``verifier=``, exactly as a single open ``submit`` does — an escrow
-        key that cannot be checked is not one this SDK will seal to.
+        list can. That path requires a client built with ``verifier=``, exactly
+        as a single open ``submit`` does — an escrow key that cannot be checked
+        is not one this SDK will seal to.
 
         ``custom_id`` is optional (1–64 characters, unique within the batch) and
         **travels sealed inside its line's container**, coming back inside the
@@ -163,7 +172,7 @@ class Batches:
                 raise ValidationError(
                     f"line {n}: body.model is required", type="invalid_request_error"
                 )
-            for key in ("rate_in", "rate_out"):
+            for key in ("max_rate_in", "max_rate_out"):
                 usd_arg(body.get(key), f"line {n}: {key}")
             endpoints.add(_endpoint_of(line, n))
             by_model.setdefault(body["model"], []).append(i)
@@ -186,7 +195,7 @@ class Batches:
                 for i in indexes:
                     check_input(schema, _input_of(lines[i]))
 
-        # -- the plan: who takes each unpriced line, at which ask -------------
+        # -- the plan: who takes each line, at which rates --------------------
         ctx = await client.chain_context()
         picks = await self._plan(lines, window, ctx.decimals)
 
@@ -198,12 +207,12 @@ class Batches:
             # model-owned input go to different places, and a `pop` in an argument
             # list mutates the dict the neighbouring argument already points at.
             model = body.pop("model")
-            rate_in = usd_atomic(body.pop("rate_in", None), f"line {i + 1}: rate_in", ctx.decimals)
-            rate_out = usd_atomic(body.pop("rate_out", None), f"line {i + 1}: rate_out", ctx.decimals)
+            body.pop("max_rate_in", None)
+            body.pop("max_rate_out", None)
             units_out = body.pop("units_out", None)
-            provider = _provider_for(providers, i)
-            if i in picks:
-                provider, rate_in, rate_out = picks[i]
+            provider, rate_in, rate_out = picks[i]
+            if provider is None:  # not planned: it rests
+                provider = _provider_for(providers, i)
             sealed.append(
                 await client._seal_line(
                     model=model,
@@ -241,80 +250,135 @@ class Batches:
 
     async def _plan(
         self, lines: list[dict], window: str, decimals: int
-    ) -> dict[int, tuple[int, int, int]]:
-        """Provider and atomic ask for every line that names no bid, from the coordinator's plan.
+    ) -> list[tuple[int | None, int, int]]:
+        """Provider and atomic rates for every line, from the coordinator's plan.
 
-        One ``POST /v1/batches`` with no file: per model, the line count and the
-        summed units. The node answers which providers take how many lines, never
-        past a provider's on-chain capacity. A model the network cannot take in
-        full in this window refuses the whole batch before anything is signed.
+        One ``POST /v1/batches`` with no file: per model and pair of ceilings, the
+        line count and the summed units. The node answers which providers within
+        the ceilings take how many lines, never past a provider's on-chain
+        capacity, and a placed line signs its provider's ask. A line left over
+        rests, with no provider (``None``), at its ceilings; a side with no
+        ceiling rests at the market rate, read by one more plan that names none.
+        A line with no ceiling at all cannot rest, so a batch that leaves one
+        over is refused before anything is signed.
         """
         from ._client import _declare_units
 
         client = self._client
-        unpriced: dict[str, list[int]] = {}
-        units: dict[str, list[int]] = {}
+        groups: dict[_Key, list[int]] = {}
+        units: dict[_Key, list[int]] = {}
         for i, line in enumerate(lines):
             body = line["body"]
-            if body.get("rate_in") is not None or body.get("rate_out") is not None:
-                continue
-            model = body["model"]
-            unpriced.setdefault(model, []).append(i)
+            key = (
+                body["model"],
+                usd_atomic(body.get("max_rate_in"), f"line {i + 1}: max_rate_in", decimals),
+                usd_atomic(body.get("max_rate_out"), f"line {i + 1}: max_rate_out", decimals),
+            )
+            groups.setdefault(key, []).append(i)
             u_in, u_out = _declare_units(_input_of(line), body.get("units_out"))
-            total = units.setdefault(model, [0, 0])
+            total = units.setdefault(key, [0, 0])
             total[0] += u_in
             total[1] += u_out
-        if not unpriced:
-            return {}
 
-        models = list(unpriced)
-        request = {
-            "completion_window": window,
-            "models": [
-                {"model_id": await client._model_id(m), "lines": len(unpriced[m]),
-                 "units_in": units[m][0], "units_out": units[m][1]}
-                for m in models
-            ],
-        }
-        resp = await client._request(
-            "POST", "/v1/batches", json=request, retry=False, allow_statuses=frozenset({402}),
-        )
-        plan = (resp.json() or {}).get("plan") if resp.status_code == 402 else None
-        if not isinstance(plan, list) or len(plan) != len(models):
-            raise VorqError(
-                f"POST /v1/batches answered {resp.status_code} to a plan without one plan "
-                "entry per model", type="api_error", status_code=resp.status_code,
+        async def allocations(
+            entries: list[tuple[_Key, int]], ceilings: bool = True
+        ) -> list[list[tuple[int, int, int, int]]]:
+            """Per entry ``(key, lines)``: the ``(provider, rate_in, rate_out, lines)`` shares the node plans."""
+            models = []
+            for key, count in entries:
+                model, max_in, max_out = key if ceilings else (key[0], None, None)
+                entry: dict[str, Any] = {
+                    "model_id": await client._model_id(model), "lines": count,
+                    "units_in": units[key][0], "units_out": units[key][1],
+                }
+                if max_in is not None:
+                    entry["max_rate_in"] = format_usd(max_in, decimals)
+                if max_out is not None:
+                    entry["max_rate_out"] = format_usd(max_out, decimals)
+                models.append(entry)
+            resp = await client._request(
+                "POST", "/v1/batches", json={"completion_window": window, "models": models},
+                retry=False, allow_statuses=frozenset({402}),
             )
-
-        picks: dict[int, tuple[int, int, int]] = {}
-        for model, entry in zip(models, plan):
-            allocation = entry.get("allocation") if isinstance(entry, dict) else None
-            if not isinstance(allocation, list):
-                raise VorqError("a plan entry carries no allocation list",
-                                type="api_error", status_code=402)
-            queue = iter(unpriced[model])
-            placed = 0
-            for share in allocation:
+            plan = (resp.json() or {}).get("plan") if resp.status_code == 402 else None
+            if not isinstance(plan, list) or len(plan) != len(entries):
+                raise VorqError(
+                    f"POST /v1/batches answered {resp.status_code} to a plan without one plan "
+                    "entry per entry asked", type="api_error", status_code=resp.status_code,
+                )
+            shares: list[list[tuple[int, int, int, int]]] = []
+            for entry in plan:
+                allocation = entry.get("allocation") if isinstance(entry, dict) else None
+                if not isinstance(allocation, list):
+                    raise VorqError("a plan entry carries no allocation list",
+                                    type="api_error", status_code=402)
                 try:
-                    pid = int(share["provider_id"])
-                    rate_in = wire_atomic(share["rate_in"], "allocation[].rate_in", decimals)
-                    rate_out = wire_atomic(share["rate_out"], "allocation[].rate_out", decimals)
-                    count = int(share["lines"])
+                    shares.append([
+                        (
+                            int(share["provider_id"]),
+                            wire_atomic(share["rate_in"], "allocation[].rate_in", decimals),
+                            wire_atomic(share["rate_out"], "allocation[].rate_out", decimals),
+                            int(share["lines"]),
+                        )
+                        for share in allocation
+                    ])
                 except (KeyError, TypeError, ValueError, VorqError) as exc:
                     raise VorqError(f"a plan allocation is unreadable: {exc}",
                                     type="api_error", status_code=402) from exc
-                for _ in range(min(count, len(unpriced[model]) - placed)):
-                    picks[next(queue)] = (pid, rate_in, rate_out)
-                    placed += 1
-            if placed < len(unpriced[model]):
-                raise ValidationError(
-                    f"the network can take {placed} of the {len(unpriced[model])} unpriced "
-                    f"{model} lines in the {window} window right now, so nothing was signed. "
-                    "Split the file, try the other window, or name rate_in and rate_out on "
-                    "the lines",
-                    type="invalid_request_error",
+            return shares
+
+        keys = list(groups)
+        picks: dict[int, tuple[int | None, int, int]] = {}
+        left: dict[_Key, list[int]] = {}
+        for key, shares in zip(keys, await allocations([(k, len(groups[k])) for k in keys])):
+            _, max_in, max_out = key
+            queue = iter(groups[key])
+            for pid, rate_in, rate_out, count in shares:
+                if (max_in is not None and rate_in > max_in) or (
+                    max_out is not None and rate_out > max_out
+                ):
+                    raise VorqError(
+                        f"the node planned provider {pid} at an ask above the ceilings the "
+                        "plan set", type="api_error", status_code=402,
+                    )
+                for i in islice(queue, count):
+                    picks[i] = (pid, rate_in, rate_out)
+            rest = list(queue)
+            if rest:
+                left[key] = rest
+
+        def refuse(key: _Key) -> ValidationError:
+            model, placed = key[0], len(groups[key]) - len(left[key])
+            return ValidationError(
+                f"the network can take {placed} of the {len(groups[key])} {model} lines "
+                f"without both ceilings in the {window} window right now, so nothing was "
+                "signed. Split the file, try the other window, or name max_rate_in and "
+                "max_rate_out on the lines",
+                type="invalid_request_error",
+            )
+
+        # -- the lines that rest: at their ceilings, the market rate where there is none
+        for key in left:
+            if key[1] is None and key[2] is None:
+                raise refuse(key)
+        unnamed = [key for key in left if key[1] is None or key[2] is None]
+        market: dict[_Key, tuple[int, int]] = {}
+        if unnamed:
+            asks = await allocations([(key, len(left[key])) for key in unnamed], ceilings=False)
+            for key, shares in zip(unnamed, asks):
+                if not shares:
+                    raise refuse(key)
+                market[key] = shares[0][1], shares[0][2]
+        for key, indexes in left.items():
+            _, max_in, max_out = key
+            ask_in, ask_out = market.get(key, (0, 0))
+            for i in indexes:
+                picks[i] = (
+                    None,
+                    ask_in if max_in is None else max_in,
+                    ask_out if max_out is None else max_out,
                 )
-        return picks
+        return [picks[i] for i in range(len(lines))]
 
     async def _fees(self, line: "SealedLine", decimals: int) -> tuple[int, int]:
         """What every line's payment has to cover beyond its cap, read once: the atomic gas fee and ``fee_bps``.
@@ -368,7 +432,7 @@ def _input_of(line: dict) -> dict:
     return {
         k: v
         for k, v in line["body"].items()
-        if k not in ("model", "rate_in", "rate_out", "units_out")
+        if k not in ("model", "max_rate_in", "max_rate_out", "units_out")
     }
 
 

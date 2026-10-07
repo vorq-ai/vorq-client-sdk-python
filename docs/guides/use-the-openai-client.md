@@ -29,7 +29,7 @@ client = OpenAI(
 ```
 
 - `sealing_http_client()` talks to `https://api.vorq.co` and signs with `VORQ_WALLET_KEY`.
-- To post a bid that rests until a provider takes it, pass
+- To let an order rest when no provider is within its ceilings, pass
   `verifier=vorq.Verifier("https://api.vorq.co")` as well: such an order is sealed to the
   coordinator's escrow key, which the client verifies first.
 
@@ -48,13 +48,25 @@ Without `background`, the call blocks until the job settles, for at most the job
 window. If the job hasn't settled by then, the call raises `openai.BadRequestError`.
 
 The `vorq` block carries the order terms the Responses schema has no field for: `sla`,
-`rate_in`, `rate_out` and an optional `provider` id.
+`max_rate_in`, `max_rate_out` and an optional `provider` id.
+
+```python
+resp = client.responses.create(
+    model="moonshotai/kimi-k3",
+    input="Say hello.",
+    extra_body={"vorq": {"sla": "batch", "max_rate_in": "0.6"}},
+)
+```
+
+`max_rate_in` protects you from being overcharged: the order never signs an input rate above
+it, and pays less when a provider asks less. Set it too low and no provider matches: the order
+[rests](../concepts/bids-and-matching.md#resting-orders) and may expire without being served.
 
 - `sla` defaults to `"1h"` on this path.
-- `rate_in` and `rate_out` are USD per 1M units as decimal strings, such as `"0.05"`. A JSON
-  number is refused.
-- With no rates, the order takes the market: the first provider the coordinator ranks, at its
-  own ask. See [Bids and matching](../concepts/bids-and-matching.md#no-bid-named).
+- `max_rate_in` and `max_rate_out` are the most the order pays, in USD per 1M units, as decimal
+  strings such as `"0.05"`. A JSON number is refused. Each is optional.
+- The order signs the ask of the first provider the coordinator ranks within the ceilings. See
+  [Bids and matching](../concepts/bids-and-matching.md#how-an-order-is-matched).
 
 ## Create a response in the background
 

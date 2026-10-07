@@ -100,6 +100,19 @@ def market_candidate(provider_id: int) -> dict:
             "rate_out": format_usd(2000 * provider_id, 6)}
 
 
+def is_probe(body: dict) -> bool:
+    """A market probe: the one `POST /v1/jobs` body that names no rate."""
+    return "rate_in" not in body and "rate_out" not in body
+
+
+def within_ceilings(candidate: dict, probe: dict) -> bool:
+    """Whether a candidate's ask is at or under the ceilings a probe names."""
+    return all(
+        Decimal(candidate[side]) <= Decimal(probe[f"max_{side}"])
+        for side in ("rate_in", "rate_out") if f"max_{side}" in probe
+    )
+
+
 def provider_record(provider_id: int, box_key: str = BOX_PUBLIC, **over) -> dict:
     """`GET /evm/providers/{id}` — the registry record, as the index projects it."""
     record = {
@@ -129,16 +142,17 @@ def quote_body(
     let a client that ignores the quote pass.
 
     A market probe (no rates, unsigned) is answered with ``candidates`` alone:
-    the given list, or the pinned provider (provider 1 when unpinned). On a
+    the given list, or the pinned provider (provider 1 when unpinned), less any
+    whose ask is above a ceiling the probe names. On a
     signed challenge ``candidates`` is added only when given.
     ``fee_bps=None`` leaves it off too, which is a node that cannot be priced.
     Money is USD strings; the authorization's ``value`` is the atomic integer signed.
     """
     v = body  # flat; a form body (the 409 path) carries strings
-    if "rate_in" not in v and "rate_out" not in v:
+    if is_probe(v):
         if candidates is None:
             candidates = [market_candidate(int(v.get("designated") or 0) or 1)]
-        return {"candidates": candidates}
+        return {"candidates": [c for c in candidates if within_ceilings(c, v)]}
     extra = {} if candidates is None else {"candidates": candidates}
     fee = {} if fee_bps is None else {"fee_bps": fee_bps}
     return {
@@ -467,13 +481,14 @@ class TestSubmit:
             model="black-forest-labs/flux-2-dev:fp8",
             input={"prompt": "a cat", "seed": 7},
             sla="1h",
-            rate_out="0.03",
+            max_rate_out="0.03",
             provider=1,
         )
         terms = captured["challenge_body"]
         assert terms["sla_secs"] == 3600
         # Money goes out as a canonical USD string; every other integer as a JSON number.
-        assert terms["rate_out"] == "0.03"
+        # The order signs provider 1's ask, which is under the 0.03 ceiling.
+        assert terms["rate_out"] == "0.002"
         assert terms["model_id"] == 2          # resolved from the catalog, not the name
         assert _open_complete(captured["complete"])["input"] == {
             "prompt": "a cat", "seed": 7
@@ -561,7 +576,7 @@ class TestSubmit:
             lambda r: json_response(500, {})
         )))
         with pytest.raises(ValidationError, match=r'USD per 1M units, e\.g\. "0\.05"'):
-            await client.submit(model="m", input="x", sla="1h", rate_out=rate, provider=1)
+            await client.submit(model="m", input="x", sla="1h", max_rate_out=rate, provider=1)
         await client.aclose()
 
     async def test_a_rate_finer_than_the_token_is_refused_rather_than_rounded(self):
@@ -571,7 +586,7 @@ class TestSubmit:
             lambda r: json_response(500, {})
         )))
         with pytest.raises(ValidationError, match="fraction digits"):
-            await client.submit(model="m", input="x", sla="1h", rate_out="0.0000001", provider=1)
+            await client.submit(model="m", input="x", sla="1h", max_rate_out="0.0000001", provider=1)
         await client.aclose()
 
     async def test_a_decimal_rate_is_signed_atomic_and_sent_as_usd(self):
@@ -580,15 +595,18 @@ class TestSubmit:
         def jobs(request):
             body = req_body(request)
             if "auth_sig" not in body:
-                captured["challenge"] = body
+                captured["probe" if is_probe(body) else "challenge"] = body
                 return json_response(402, quote_body(body))
             return json_response(200, queued_job(sla="1h"))
 
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
-        await client.submit(model="m", input="x", sla="1h", rate_in=Decimal("0.050"),
-                            rate_out="340282366920938463463374607431768.211455", provider=1)
-        assert captured["challenge"]["rate_in"] == "0.05"
-        assert captured["challenge"]["rate_out"] == "340282366920938463463374607431768.211455"
+        await client.submit(model="m", input="x", sla="1h", max_rate_in=Decimal("0.050"),
+                            max_rate_out="340282366920938463463374607431768.211455", provider=1)
+        assert captured["probe"]["max_rate_in"] == "0.05"
+        assert captured["probe"]["max_rate_out"] == "340282366920938463463374607431768.211455"
+        # What is signed is the ask the probe named, never the ceiling.
+        assert captured["challenge"]["rate_in"] == "0.001"
+        assert captured["challenge"]["rate_out"] == "0.002"
         await client.aclose()
 
     async def test_a_model_the_catalog_does_not_carry_is_refused(self):
@@ -878,7 +896,7 @@ class TestEncryptedSubmit:
 
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hello", sla="batch",
-                            rate_in="0.05", rate_out="0.15", provider=1)
+                            max_rate_in="0.05", max_rate_out="0.15", provider=1)
         # Phase 1 carried terms only — no payload left the client.
         assert "container" not in captured["challenge_body"]
         # The complete submission is JSON too — the door never went back to a
@@ -976,10 +994,10 @@ class TestEncryptedSubmit:
 
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi", sla="batch",
-                            rate_out="0.15", provider=1)
-        assert len(posts) == 2
-        assert "container" not in posts[0]
-        assert "container" in posts[1]
+                            max_rate_out="0.15", provider=1)
+        probe, challenge, complete = posts
+        assert "container" not in probe and "container" not in challenge
+        assert "container" in complete
         await client.aclose()
 
     async def test_the_challenge_is_the_flat_order_and_nothing_else(self):
@@ -997,7 +1015,7 @@ class TestEncryptedSubmit:
 
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi", sla="batch",
-                            rate_out="0.15", provider=1)
+                            max_rate_out="0.15", provider=1)
         assert captured["challenge_type"].startswith("application/json")
         assert set(captured["challenge"]) == {
             "c", "owner", "job_id", "model_id", "sla_secs", "rate_in", "rate_out",
@@ -1032,7 +1050,7 @@ class TestEncryptedSubmit:
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         prompt = "x" * (INLINE_MAX_BYTES + 1024)
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input=prompt, sla="batch",
-                            rate_out="0.15", provider=1)
+                            max_rate_out="0.15", provider=1)
 
         assert captured["upload_type"].startswith("multipart/form-data")
         names = [name for name, _, _ in captured["upload_parts"]]
@@ -1073,7 +1091,7 @@ class TestEncryptedSubmit:
 
         client = Client(transport=httpx.MockTransport(auth_router(calibrate)))
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="", sla="batch",
-                            rate_out="0.15", provider=1)
+                            max_rate_out="0.15", provider=1)
         await client.aclose()
         overhead = len(base64.b64decode(probe["container"]))
 
@@ -1100,7 +1118,7 @@ class TestEncryptedSubmit:
         client = Client(transport=httpx.MockTransport(auth_router(router(at_bound))))
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8",
                             input="x" * (INLINE_MAX_BYTES - overhead), sla="batch",
-                            rate_out="0.15", provider=1)
+                            max_rate_out="0.15", provider=1)
         await client.aclose()
         assert at_bound["uploads"] == 0
         assert len(base64.b64decode(at_bound["complete"]["container"])) == INLINE_MAX_BYTES
@@ -1111,7 +1129,7 @@ class TestEncryptedSubmit:
         client = Client(transport=httpx.MockTransport(auth_router(router(over))))
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8",
                             input="x" * (INLINE_MAX_BYTES - overhead + 1), sla="batch",
-                            rate_out="0.15", provider=1)
+                            max_rate_out="0.15", provider=1)
         await client.aclose()
         assert over["uploads"] == 1
         assert over["filed"] == INLINE_MAX_BYTES + 1
@@ -1143,7 +1161,7 @@ class TestEncryptedSubmit:
         prompt = "x" * (INLINE_MAX_BYTES + 1024)
         with pytest.raises(VorqError, match="no vorq.cid for file file_container"):
             await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input=prompt,
-                                sla="batch", rate_out="0.15", provider=1)
+                                sla="batch", max_rate_out="0.15", provider=1)
         assert posts == []  # nothing was posted against a name that does not exist
         await client.aclose()
 
@@ -1178,7 +1196,7 @@ class TestEncryptedSubmit:
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         prompt = "x" * (INLINE_MAX_BYTES + 1024)
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input=prompt, sla="batch",
-                            rate_out="0.15", provider=1)
+                            max_rate_out="0.15", provider=1)
         assert state["uploads"] == 1  # filed once, not twice
         assert state["posts"] == 2  # posted, dropped, re-posted
         assert state["second_body"]["container_cid"] == state["cid"]
@@ -1214,7 +1232,7 @@ class TestEncryptedSubmit:
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         prompt = "x" * (INLINE_MAX_BYTES + 1024)
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input=prompt, sla="batch",
-                            rate_out="0.15", provider=1)
+                            max_rate_out="0.15", provider=1)
         assert state["uploads"] == 1  # filed once, not once per attempt
         assert len(posts) == 2
         assert "container" not in posts[0] and "container" not in posts[1]
@@ -1244,7 +1262,7 @@ class TestEncryptedSubmit:
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         with pytest.raises(VorqError, match="402 to a body carrying a container"):
             await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi", sla="batch",
-                                rate_out="0.15", provider=1)
+                                max_rate_out="0.15", provider=1)
         assert len(posts) == 1  # uploaded once, then refused — never a second time
         await client.aclose()
 
@@ -1269,7 +1287,7 @@ class TestEncryptedSubmit:
 
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi", sla="batch",
-                            rate_out="0.15", provider=1)
+                            max_rate_out="0.15", provider=1)
         assert len(posts) == 2
         # Same container, same commitment, same job id: nothing was re-sealed, so
         # the client did not burn a `c` to answer a moving gas fee.
@@ -1301,7 +1319,7 @@ class TestEncryptedSubmit:
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         with pytest.raises(VorqError) as exc:
             await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi", sla="batch",
-                                rate_out="0.15", provider=1)
+                                max_rate_out="0.15", provider=1)
         # The node's own refusal reaches the caller verbatim — not the client's
         # complaint that a quote it expected was missing. Told apart by **body**:
         # a code path that branched on the status alone would send this one into
@@ -1325,7 +1343,7 @@ class TestEncryptedSubmit:
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         with pytest.raises(VorqError, match="re-quoted"):
             await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi", sla="batch",
-                                rate_out="0.15", provider=1)
+                                max_rate_out="0.15", provider=1)
         assert len(posts) == MAX_SUBMIT_ATTEMPTS
         await client.aclose()
 
@@ -1338,13 +1356,20 @@ class TestEncryptedSubmit:
         short-circuit accepted exactly that answer and skipped phase 2 entirely.
         """
         def jobs(request):
+            body = req_body(request)
+            if is_probe(body):
+                return json_response(402, quote_body(body))
             return json_response(200, queued_job(sla="24h"))
 
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         with pytest.raises(VorqError, match="terms-only body"):
             await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi", sla="batch",
-                                rate_in="0.000001", rate_out="0.000001", provider=1)
+                                provider=1)
+        await client.aclose()
         # The market probe has the same single valid answer.
+        client = Client(transport=httpx.MockTransport(auth_router(
+            lambda r: json_response(200, queued_job(sla="24h"))
+        )))
         with pytest.raises(VorqError, match="market probe"):
             await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi", sla="batch")
         await client.aclose()
@@ -1386,6 +1411,8 @@ class TestEncryptedSubmit:
         def jobs(request):
             body = req_body(request)
             posts.append(body)
+            if is_probe(body):
+                return json_response(402, quote_body(body))
             if "auth_sig" not in body:
                 return json_response(402, challenge(body))
             return json_response(200, queued_job(sla="24h"))
@@ -1393,7 +1420,7 @@ class TestEncryptedSubmit:
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         with pytest.raises(VorqError, match=match) as exc:
             await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi",
-                                sla="batch", rate_out="0.15", provider=1)
+                                sla="batch", max_rate_out="0.15", provider=1)
         assert exc.value.status_code == 402
         # The refusal is the whole point: no funded body ever went out.
         assert not [p for p in posts if "auth_sig" in p]
@@ -1424,7 +1451,7 @@ class TestEncryptedSubmit:
 
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         handle = await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi",
-                                     sla="batch", rate_out="0.15", provider=1)
+                                     sla="batch", max_rate_out="0.15", provider=1)
         assert state["posts"] == 1                       # uploaded once, not twice
         assert state["gets"] == 1                        # and read back instead
         assert state["asked"] == f"/v1/jobs/{state['job_id']}"
@@ -1449,18 +1476,17 @@ class TestEncryptedSubmit:
 
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi", sla="batch",
-                            rate_out="0.15", provider=1)
+                            max_rate_out="0.15", provider=1)
         assert state["gets"] == 1 and state["posts"] == 2
         await client.aclose()
 
-    async def test_a_challenge_naming_candidates_designates_the_first_and_seals_to_its_key(self):
-        """Hosted matching. The `402` names the clearing candidates, ranked by
-        the node, and an unpinned order takes the first: sealed to its box key,
-        `designated` set to its id — no escrow key, no registry read, and no
-        verifier needed. The client cannot know the recipient before it signs,
-        so it asks first with a **probe**: signed terms over a placeholder
-        commitment, whose only purpose is to be answered. The bytes still cross
-        the wire once, on the complete submission.
+    async def test_a_probe_naming_candidates_designates_the_first_and_signs_its_ask(self):
+        """Hosted matching. The probe's `402` names the asks within the
+        ceilings, ranked by the node, and an unpinned order takes the first:
+        sealed to its box key, `designated` set to its id, signed at its ask —
+        no escrow key, no registry read, and no verifier needed. The probe is
+        unsigned and names no commitment. The bytes still cross the wire once,
+        on the complete submission.
         """
         first, second = SealedBoxCipher.generate(), SealedBoxCipher.generate()
         candidates = [
@@ -1485,12 +1511,13 @@ class TestEncryptedSubmit:
 
         client = Client(transport=httpx.MockTransport(spy))
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi", sla="batch",
-                            rate_out="0.15")
+                            max_rate_out="0.15")
         assert len(challenges) == 2 and len(completes) == 1
         probe, real = challenges
         assert "container" not in probe and "container" not in real
-        assert probe["designated"] == 0
-        assert probe["job_id"] != real["job_id"]
+        assert probe["designated"] == 0 and probe["max_rate_out"] == "0.15"
+        assert "signature" not in probe and "job_id" not in probe
+        assert (real["rate_in"], real["rate_out"]) == ("0.000001", "0.000002")
         complete = completes[0]
         assert complete["job_id"] == real["job_id"]
         assert int(complete["designated"]) == 5
@@ -1501,32 +1528,109 @@ class TestEncryptedSubmit:
         assert not [p for p in paths if p.startswith("/evm/providers/")]
         await client.aclose()
 
-    async def test_an_explicit_pin_never_looks_at_the_candidates(self):
-        """A pin is a refusal to be matched: one challenge, sealed to the pinned
-        provider's registry key, whatever the node would have named."""
-        other = SealedBoxCipher.generate()
-        candidates = [{"provider_id": 5, "box_key": other.public_key,
-                       "rate_in": "0.000001", "rate_out": "0.000002"}]
+    async def test_an_explicit_pin_probes_only_that_provider(self):
+        """A pin is a refusal to be matched: the probe is pinned too, and the
+        order signs that provider's ask or none."""
         challenges, completes = [], []
 
         def jobs(request):
             body = req_body(request)
             if "auth_sig" not in body:
                 challenges.append(body)
-                return json_response(402, quote_body(body, candidates=candidates))
+                return json_response(402, quote_body(body))
             completes.append(body)
             return json_response(200, queued_job(sla="24h"))
 
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi", sla="batch",
-                            rate_out="0.15", provider=2)
-        assert len(challenges) == 1
+                            max_rate_out="0.15", provider=2)
+        probe, real = challenges
+        assert probe["designated"] == 2
+        assert (real["rate_in"], real["rate_out"]) == ("0.002", "0.004")
         assert int(completes[0]["designated"]) == 2
         assert _open_complete(completes[0])["input"] == {"input": "hi"}
         await client.aclose()
 
-    async def test_an_empty_candidate_list_rests_the_order_as_an_open_bid(self):
-        """Nothing clears the bid: the order is what it always became — sealed to
+    async def test_an_input_ceiling_alone_signs_the_ask_on_both_sides(self):
+        """Only `max_rate_in`, and a provider within it: the output side has no
+        ceiling, so the order signs that provider's own output rate — not zero."""
+        probes, challenges, completes = [], [], []
+
+        def jobs(request):
+            body = req_body(request)
+            if is_probe(body):
+                probes.append(body)
+                return json_response(402, quote_body(body))
+            if "auth_sig" not in body:
+                challenges.append(body)
+                return json_response(402, quote_body(body))
+            completes.append(body)
+            return json_response(200, queued_job(sla="24h"))
+
+        client = Client(transport=httpx.MockTransport(auth_router(jobs)))
+        await client.submit(model="m", input="hi", sla="batch", max_rate_in="0.05")
+        [probe] = probes
+        assert probe["max_rate_in"] == "0.05" and "max_rate_out" not in probe
+        # market_candidate(1): 0.001 in, under the ceiling, and 0.002 out.
+        assert (challenges[0]["rate_in"], challenges[0]["rate_out"]) == ("0.001", "0.002")
+        assert int(completes[0]["designated"]) == 1
+        await client.aclose()
+
+    async def test_a_candidate_above_a_ceiling_is_refused(self):
+        """The node filters by the ceilings; a node that did not is not signed for."""
+        def jobs(request):
+            return json_response(402, {"candidates": [market_candidate(1)]})
+
+        client = Client(transport=httpx.MockTransport(auth_router(jobs)))
+        with pytest.raises(VorqError, match="above the ceilings"):
+            await client.submit(model="m", input="hi", sla="batch", max_rate_in="0.0005")
+        await client.aclose()
+
+    async def test_one_ceiling_rests_at_it_and_the_market_rate_on_the_other_side(self):
+        """No ask is within the input ceiling, so the order rests: at the ceiling
+        on the side that names one, and at the cheapest live ask's rate on the
+        side that does not — an order signs both rates."""
+        probes, challenges, completes = [], [], []
+
+        def jobs(request):
+            body = req_body(request)
+            if is_probe(body):
+                probes.append(body)
+                return json_response(402, quote_body(body))
+            if "auth_sig" not in body:
+                challenges.append(body)
+                return json_response(402, quote_body(body))
+            completes.append(body)
+            return json_response(200, queued_job(sla="24h"))
+
+        client = Client(transport=httpx.MockTransport(auth_router(jobs)),
+                        verifier=escrow_verifier())
+        await client.submit(model="m", input="hi", sla="batch", max_rate_in="0.0005")
+        ceiling, market = probes
+        assert ceiling["max_rate_in"] == "0.0005" and "max_rate_out" not in ceiling
+        assert "max_rate_in" not in market and "max_rate_out" not in market
+        assert (challenges[0]["rate_in"], challenges[0]["rate_out"]) == ("0.0005", "0.002")
+        assert int(completes[0]["designated"]) == 0
+        assert _open_complete(completes[0], ESCROW_SECRET)["input"] == {"input": "hi"}
+        await client.aclose()
+
+    async def test_one_ceiling_and_no_live_ask_is_refused_before_anything_is_signed(self):
+        """With no live ask there is no rate for the unnamed side to rest at."""
+        posts = []
+
+        def jobs(request):
+            posts.append(req_body(request))
+            return json_response(402, {"candidates": []})
+
+        client = Client(transport=httpx.MockTransport(auth_router(jobs)),
+                        verifier=escrow_verifier())
+        with pytest.raises(ValidationError, match="no provider is serving"):
+            await client.submit(model="m", input="hi", sla="batch", max_rate_in="0.0005")
+        assert all(is_probe(p) for p in posts) and len(posts) == 2
+        await client.aclose()
+
+    async def test_an_empty_candidate_list_rests_the_order_at_its_ceilings(self):
+        """No ask is within the ceilings: the order rests at them — sealed to
         the verified escrow key, `designated` 0."""
         completes = []
 
@@ -1540,7 +1644,8 @@ class TestEncryptedSubmit:
         client = Client(transport=httpx.MockTransport(auth_router(jobs)),
                         verifier=escrow_verifier())
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="cheap",
-                            sla="batch", rate_out="0.001")
+                            sla="batch", max_rate_in="0.0003", max_rate_out="0.001")
+        assert (completes[0]["rate_in"], completes[0]["rate_out"]) == ("0.0003", "0.001")
         assert int(completes[0]["designated"]) == 0
         assert _open_complete(completes[0], ESCROW_SECRET)["input"] == {"input": "cheap"}
         await client.aclose()
@@ -1553,7 +1658,7 @@ class TestEncryptedSubmit:
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         with pytest.raises(VorqError, match="candidates"):
             await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi",
-                                sla="batch", rate_out="0.15")
+                                sla="batch", max_rate_out="0.15")
         await client.aclose()
 
     async def test_an_open_order_seals_to_the_verified_escrow_key(self):
@@ -1570,7 +1675,7 @@ class TestEncryptedSubmit:
         client = Client(transport=httpx.MockTransport(auth_router(jobs)),
                         verifier=escrow_verifier())
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="cheap",
-                            sla="batch", rate_out="0.001")
+                            sla="batch", max_rate_out="0.001")
         complete = captured["complete"]
         # Q22: an open order designates 0. That is the contract's sentinel for
         # "any provider", not an absence — a null has nowhere to live in a uint32.
@@ -1609,7 +1714,7 @@ class TestEncryptedSubmit:
 
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         with pytest.raises(EscrowKeyUnverified, match="no verifier"):
-            await client.submit(model="m", input="hi", sla="batch", rate_in="0.000001", rate_out="0.000001")
+            await client.submit(model="m", input="hi", sla="batch", max_rate_in="0.000001", max_rate_out="0.000001")
         assert posts == []
         await client.aclose()
 
@@ -1635,7 +1740,7 @@ class TestEncryptedSubmit:
             verifier=escrow_verifier(httpx.MockTransport(allowlist)),
         )
         with pytest.raises(EscrowKeyUnverified, match="revoked"):
-            await client.submit(model="m", input="hi", sla="batch", rate_in="0.000001", rate_out="0.000001")
+            await client.submit(model="m", input="hi", sla="batch", max_rate_in="0.000001", max_rate_out="0.000001")
         assert posts == []
         await client.aclose()
 
@@ -1664,7 +1769,7 @@ class TestEncryptedSubmit:
             verifier=escrow_verifier(),
         )
         with pytest.raises(EscrowKeyUnverified, match="does not bind"):
-            await client.submit(model="m", input="hi", sla="batch", rate_in="0.000001", rate_out="0.000001")
+            await client.submit(model="m", input="hi", sla="batch", max_rate_in="0.000001", max_rate_out="0.000001")
         assert posts == []
         await client.aclose()
 
@@ -1685,7 +1790,7 @@ class TestEncryptedSubmit:
             verifier=escrow_verifier(now=1_790_003_600.0),
         )
         with pytest.raises(EscrowKeyUnverified, match="freshness bound"):
-            await client.submit(model="m", input="hi", sla="batch", rate_in="0.000001", rate_out="0.000001")
+            await client.submit(model="m", input="hi", sla="batch", max_rate_in="0.000001", max_rate_out="0.000001")
         assert posts == []
         await client.aclose()
 
@@ -1700,8 +1805,8 @@ class TestEncryptedSubmit:
 
         client = Client(transport=httpx.MockTransport(auth_router(jobs, seen=seen)),
                         verifier=escrow_verifier())
-        await client.submit(model="m", input="a", sla="batch", rate_in="0.000001", rate_out="0.000001")
-        await client.submit(model="m", input="b", sla="batch", rate_in="0.000001", rate_out="0.000001")
+        await client.submit(model="m", input="a", sla="batch", max_rate_in="0.000001", max_rate_out="0.000001")
+        await client.submit(model="m", input="b", sla="batch", max_rate_in="0.000001", max_rate_out="0.000001")
         assert seen["key_calls"] == 1
         # And so is the chain context: a coordinator that changed the contract it
         # relays to mid-session has changed protocol, not configuration.
@@ -2718,7 +2823,7 @@ async def test_a_confidential_submission_with_no_verified_candidate_raises():
 
 
 async def test_a_confidential_submission_with_no_candidates_raises():
-    """A named bid that nothing clears would rest as an escrowed open bid, which
+    """An order no ask is within would rest as an escrowed open order, which
     cannot be an attested channel — so under `confidential=True` it is a refusal."""
     from vorq.errors import VerificationError
     from vorq.verify import Verifier
@@ -2731,8 +2836,8 @@ async def test_a_confidential_submission_with_no_candidates_raises():
         "vorq_test", signer=signer, cipher=cipher, transport=transport,
         verifier=Verifier("http://node", mode="mock", transport=transport),
     )
-    with pytest.raises(VerificationError, match="no candidate cleared"):
-        await client.submit(CONFIDENTIAL_NAME, "hi", sla="1h", rate_in="0.000001", rate_out="0.000001",
+    with pytest.raises(VerificationError, match="no provider asks within these ceilings"):
+        await client.submit(CONFIDENTIAL_NAME, "hi", sla="1h", max_rate_in="0.000001", max_rate_out="0.000001",
                             validate_params=False, confidential=True)
     assert sealed_to == []
     await client.aclose()
@@ -2782,8 +2887,8 @@ async def test_a_non_confidential_designated_submission_without_a_verifier_is_un
 
 
 async def test_a_provider_that_publishes_no_box_key_is_refused():
-    """A pinned bid to a provider with nothing to seal to is a refusal rather than a
-    null wrap. (With no bid the node would not name it at all.)"""
+    """An order resting on a pinned provider with nothing to seal to is a refusal
+    rather than a null wrap. (The node does not name such a provider at all.)"""
     from vorq.errors import VerificationError
 
     signer = WalletSigner.generate()
@@ -2796,6 +2901,8 @@ async def test_a_provider_that_publishes_no_box_key_is_refused():
             return httpx.Response(200, json=CATALOG)
         if path.startswith("/evm/providers/"):
             return httpx.Response(200, json=provider_record(1, box_key=None))
+        if path == "/v1/jobs" and is_probe(json_.loads(request.content)):
+            return httpx.Response(402, json={"candidates": []})  # the node names nobody keyless
         raise AssertionError(f"nothing should be posted: {path}")
 
     client = Client.from_session_token(
@@ -2803,7 +2910,7 @@ async def test_a_provider_that_publishes_no_box_key_is_refused():
         transport=httpx.MockTransport(handler),
     )
     with pytest.raises(VerificationError, match="no box_key"):
-        await client.submit(PLAIN_NAME, "hi", sla="1h", rate_in="0.000001", rate_out="0.000001", provider=1,
+        await client.submit(PLAIN_NAME, "hi", sla="1h", max_rate_in="0.000001", max_rate_out="0.000001", provider=1,
                             validate_params=False)
     await client.aclose()
 
@@ -2854,7 +2961,7 @@ class TestNoPinningSurface:
 
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         handle = await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hello",
-                                     sla="batch", rate_out="0.15", provider=1)
+                                     sla="batch", max_rate_out="0.15", provider=1)
         assert "task_cid" not in json_keys(captured["complete"])
         assert handle.id == captured["complete"]["job_id"]
         assert handle.task_cid == "minted-by-the-service"
@@ -2960,7 +3067,7 @@ class TestUploadFirstOperationalBounds:
         signer.sign_payment_authorization = watched  # type: ignore[method-assign]
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8",
                             input="x" * (INLINE_MAX_BYTES + 1024), sla="batch",
-                            rate_out="0.15", provider=1)
+                            max_rate_out="0.15", provider=1)
         await client.aclose()
 
         assert order == ["payment", "upload"]
@@ -2998,7 +3105,7 @@ class TestUploadFirstOperationalBounds:
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8",
                             input="x" * (INLINE_MAX_BYTES + 1024), sla="batch",
-                            rate_out="0.15", provider=1)
+                            max_rate_out="0.15", provider=1)
         await client.aclose()
 
         assert state["uploads"] == 1

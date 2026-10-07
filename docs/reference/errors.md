@@ -41,7 +41,7 @@ Statuses without a subclass, such as `402`, `429` and `5xx`, raise a plain `Vorq
 | `StateConflictError` | An illegal state change, such as cancelling a claimed or ended job. |
 | `ValidationError` | The coordinator answered `400`; or, locally: a param that fails the model's schema, a rate that is not a USD decimal string or `Decimal`, a model missing from the catalog, invalid media inputs or `units_out`, a submission without a signer or cipher, a cancel without a signer, `confidential=True` without a verifier, or an invalid batch line. |
 | `VerificationError` | A pinned provider publishes no key, or a confidential submission found no provider it could verify. Raised before the payload is sealed. |
-| `EscrowKeyUnverified` | An open order's escrow key didn't verify, or the client has no `verifier`. Nothing was posted. Configure a verifier, pin a provider with `provider=N`, or raise the bid. |
+| `EscrowKeyUnverified` | An open order's escrow key didn't verify, or the client has no `verifier`. Nothing was posted. Configure a verifier, pin a provider with `provider=N`, or raise the ceilings. |
 | `ResultIntegrityError` | A `completed` job names no `result_cid`; the bytes aren't a result object; the result doesn't open with this client's key; the result is sealed but no cipher is configured; or a frame isn't valid base64. |
 | `WaitTimeout` | `result()` or a batch wait reached its timeout. The job keeps running; `.job_id` is the job (or batch) id. |
 | `JobFailed` | `result()` found the job `failed` or `cancelled`. |

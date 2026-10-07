@@ -77,11 +77,11 @@ def usd_arg(value: object, field: str) -> str | None:
     return text
 
 
-def usd_atomic(value: object, field: str, decimals: int) -> int:
-    """A caller's USD amount as the atomic integer that is signed; ``None`` is zero."""
+def usd_atomic(value: object, field: str, decimals: int) -> int | None:
+    """A caller's USD amount as the atomic integer it is compared and signed in; ``None`` stays ``None``."""
     text = usd_arg(value, field)
     if text is None:
-        return 0
+        return None
     try:
         return parse_usd(text, decimals)
     except ValueError as exc:

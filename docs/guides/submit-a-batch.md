@@ -13,35 +13,45 @@ Pass OpenAI-style batch lines, or the path to a JSONL file of them:
 ```python
 batch = await client.batches.submit([
     {"custom_id": "en", "url": "/v1/responses",
-     "body": {"model": "moonshotai/kimi-k3", "input": "Hello"}},
+     "body": {"model": "moonshotai/kimi-k3", "input": "Hello", "max_rate_in": "0.6"}},
     {"custom_id": "fr", "url": "/v1/responses",
-     "body": {"model": "moonshotai/kimi-k3", "input": "Bonjour"}},
+     "body": {"model": "moonshotai/kimi-k3", "input": "Bonjour", "max_rate_in": "0.6"}},
 ], "batch")
 print("batch:", batch.id)   # persist this, with batch.job_ids
 ```
 
+`max_rate_in` on a line protects it from being overcharged: the line never signs an input rate
+above it, and pays less when its provider asks less. It is worth setting on every batch,
+because a batch signs and pays for all of its lines in one call, before you see what any of
+them was priced at. It caps the input side only; add `max_rate_out` to cap the output side too.
+Set it too low and no provider matches: the line [rests](../concepts/bids-and-matching.md#resting-orders) and may expire without being
+served.
+
 In each line:
 
 - `url` is `/v1/responses` (the default) or `/v1/embeddings`. One batch uses one endpoint.
-- `body.model` is required. `rate_in`, `rate_out` and `units_out` in `body` set that line's
-  order terms; everything else in `body` is the model input. Rates are USD per 1M units, as
-  decimal strings (`"0.05"`) or `Decimal`.
-- A line with neither rate takes the market. Before sealing, the client asks the coordinator for
-  a plan: which providers take how many of those lines, and at which ask. A provider is never
-  given more lines than its on-chain capacity leaves free, and each line is pinned to the
-  provider it was planned to. If the network cannot take all of a model's unpriced lines in the
-  window, the batch raises `ValidationError` before anything is signed.
+- `body.model` is required. `max_rate_in`, `max_rate_out` and `units_out` in `body` set that
+  line's order terms; everything else in `body` is the model input. The ceilings are USD per 1M
+  units, as decimal strings (`"0.05"`) or `Decimal`, and each is optional.
+- Before sealing, the client asks the coordinator for a plan: which providers within each
+  line's ceilings take how many lines, and at which ask. A provider is never given more lines
+  than its on-chain capacity leaves free, and each planned line signs its provider's ask and is
+  pinned to it.
+- A line the plan cannot place rests at its ceilings, with the market rate on a side that names
+  none (see [Resting orders](../concepts/bids-and-matching.md#resting-orders)). A line with no
+  ceiling cannot rest: if the network cannot take all such lines of a model in the window, the
+  batch raises `ValidationError` before anything is signed.
 - `custom_id` is optional: 1–64 characters, unique in the batch. It travels sealed inside the
   line and comes back on the opened result.
 
 ## Choose who serves it
 
-- **Lines with no rates** go where the plan puts them; `providers` does not apply to them.
-- **Priced lines without `providers`** are open orders sealed to the coordinator's escrow key,
+- **Planned lines** go where the plan puts them; `providers` does not apply to them.
+- **Resting lines without `providers`** are open orders sealed to the coordinator's escrow key,
   which any provider clearing its terms can claim. The client must be built with
   `verifier=vorq.Verifier(base_url)`.
-- **Priced lines with `providers=[3, 7]`** are assigned round-robin to those provider ids, and each
-  line is sealed to its provider's key.
+- **Resting lines with `providers=[3, 7]`** are assigned round-robin to those provider ids, and
+  each line is sealed to its provider's key.
 
 ## Collect the results
 

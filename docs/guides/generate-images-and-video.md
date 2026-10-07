@@ -20,14 +20,14 @@ handle = await client.submit(
         "seed": 42,
     },
     sla="batch",
-    rate_out="0.05",                   # USD per 1,000,000 output pixels
+    max_rate_out="0.05",                   # USD per 1,000,000 output pixels
 )
 result = await handle.result()        # a MediaResult
 paths = result.download("out/")       # writes out/0.png, ...
 print(paths, result.seed, result.cost)
 ```
 
-An image order buys `width × height × num_images` output pixels, so `rate_out` is a price per
+An image order buys `width × height × num_images` output pixels, so `max_rate_out` is a ceiling per
 million pixels. Width and height each default to 1024 when you leave them out.
 
 ## Generate a video
@@ -44,7 +44,7 @@ handle = await client.submit(
         "duration": 5,
     },
     sla="batch",
-    rate_out="0.002",                  # USD per 1,000,000 pixel-seconds
+    max_rate_out="0.002",                  # USD per 1,000,000 pixel-seconds
 )
 result = await handle.result()
 frame = result.frames[0]              # a video comes back as a single frame entry
@@ -76,8 +76,8 @@ handle = await client.submit(
         "resolution": "720p",
         "duration": 5,
     },
-    rate_in="0.001",                   # USD per 1,000,000 reference pixel-seconds
-    rate_out="0.002",
+    max_rate_in="0.001",                   # USD per 1,000,000 reference pixel-seconds
+    max_rate_out="0.002",
 )
 ```
 

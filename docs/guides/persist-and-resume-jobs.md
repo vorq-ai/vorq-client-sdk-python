@@ -10,7 +10,7 @@ process that held it, loses nothing as long as you kept the job id.
 
 ```python
 handle = await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="...", sla="batch",
-                             rate_in="0.65", rate_out="1.3")
+                             max_rate_in="0.65", max_rate_out="1.3")
 db.save_job(id=handle.id, status="submitted")   # before any await on the result
 ```
 
@@ -75,7 +75,7 @@ can't submit or cancel, and its token is never rotated. See
 ```python
 handles = await asyncio.gather(*[
     client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input=p, sla="async",
-                  rate_in="1", rate_out="2")
+                  max_rate_in="1", max_rate_out="2")
     for p in prompts
 ])
 for h in handles:

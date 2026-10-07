@@ -7,7 +7,6 @@ import base64
 import json
 import os
 import random
-import secrets
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -303,9 +302,9 @@ def _candidates(body: Any) -> list[dict]:
 
 @dataclass(frozen=True)
 class _SignedOrder:
-    """One signed order: the container (``None`` for a probe), its id, its terms, its wire form."""
+    """One signed order: the container, its id, its terms, its wire form."""
 
-    container: bytes | None
+    container: bytes
     job_id: str
     terms: "OrderTerms"
     vorq: dict
@@ -604,8 +603,8 @@ class Client:
         model: str,
         input: str | dict,
         sla: str = "batch",
-        rate_in: str | Decimal | None = None,
-        rate_out: str | Decimal | None = None,
+        max_rate_in: str | Decimal | None = None,
+        max_rate_out: str | Decimal | None = None,
         provider: int | None = None,
         validate_params: bool = True,
         *,
@@ -619,29 +618,31 @@ class Client:
         model-owned input object, sent verbatim.
 
         Submissions are always sealed: a wallet (``signer``) and a ``cipher`` are
-        required. A pinned order (``provider=``) takes two requests; an unpinned
-        one three. The first carries the terms and nothing else and comes back a
-        ``402`` with the clearing candidates (ids and box keys, ranked by the
-        node) and the payment requirements — for an unpinned order this first
-        challenge is a **probe** over a placeholder commitment, because the
-        recipient must be known before the real order can be sealed and signed.
-        The client then seals the payload into **one container v1** — the bulk
-        under a DEK derived from a fresh 32-byte seed, and the **seed** sealed
-        either to the chosen provider (the pin, or the first candidate) or, when
-        the challenge names nobody, to the coordinator's escrow key (the key
-        itself never travels) — signs the order over that container's
-        commitment, challenges once more for that order's own quote, signs the
-        payment authorization, and posts terms and bytes together. **The
-        container crosses the wire once**, and the answer carries the
-        ``task_cid`` the coordinator's storage service minted.
+        required. Every order takes three requests. The first is an unsigned
+        **probe**: it names the job and the ceilings and comes back a ``402``
+        with the live asks within them (ids, box keys and rates, ranked by the
+        node: cheapest for this job, then least recently picked). The client
+        then seals the payload into **one container v1** — the bulk under a DEK
+        derived from a fresh 32-byte seed, and the **seed** sealed either to the
+        chosen provider (the first candidate) or, when the probe names nobody,
+        to the pin or the coordinator's escrow key (the key itself never
+        travels) — signs the order over that container's commitment, challenges
+        for that order's quote, signs the payment authorization, and posts terms
+        and bytes together. **The container crosses the wire once**, and the
+        answer carries the ``task_cid`` the coordinator's storage service minted.
 
-        ``rate_in`` / ``rate_out`` are the bid in USD per 1M units of work, as a
-        ``str`` or ``Decimal`` (``"0.05"``); an ``int`` or ``float`` is refused.
-        With neither, the order takes the market: an
-        unsigned probe asks the node for every live ask ranked (cheapest for this
-        job, then least recently picked), and the order bids the first
-        candidate's own ask, pinned to it. No live ask raises
-        :class:`~vorq.errors.ValidationError` before anything is signed.
+        ``max_rate_in`` / ``max_rate_out`` are the most the order pays, in USD
+        per 1M units of work, as a ``str`` or ``Decimal`` (``"0.05"``); an
+        ``int`` or ``float`` is refused. Each is optional and a side left out
+        has no ceiling. When a provider asks at or under the ceilings, the order
+        signs **that provider's ask**, pinned to it — never more than the ask.
+        When none does, the order **rests** as an open order at the ceilings
+        until a provider takes it; a side with no ceiling rests at the market
+        rate, the cheapest live ask's. With no ceiling at all there is nothing
+        to rest at, and no live ask raises
+        :class:`~vorq.errors.ValidationError` before anything is signed, as it
+        does when one side is unnamed and the model has no live ask to take
+        that side's rate from.
 
         Pass ``confidential=True`` to demand attestation: the client seals only
         to a candidate whose evidence checks out against the on-chain allowlist,
@@ -656,7 +657,8 @@ class Client:
         """
         payload_input = {"input": input} if isinstance(input, str) else input
         window = normalize_sla(sla)
-        rate_in, rate_out = usd_arg(rate_in, "rate_in"), usd_arg(rate_out, "rate_out")
+        max_rate_in = usd_arg(max_rate_in, "max_rate_in")
+        max_rate_out = usd_arg(max_rate_out, "max_rate_out")
         if self.signer is None or self.cipher is None:
             raise ValidationError(
                 "submissions must be sealed: configure VORQ_WALLET_KEY "
@@ -678,7 +680,7 @@ class Client:
                 schema = None  # network hiccup on discovery never blocks a submit
             check_input(schema, payload_input)
         return await self._submit_encrypted(
-            model, payload_input, window, rate_in, rate_out, provider, confidential,
+            model, payload_input, window, max_rate_in, max_rate_out, provider, confidential,
             units_out, custom_id,
         )
 
@@ -687,8 +689,8 @@ class Client:
         model: str,
         payload_input: dict,
         window: str,
-        rate_in: str | None,
-        rate_out: str | None,
+        max_rate_in: str | None,
+        max_rate_out: str | None,
         provider: int | None,
         confidential: bool,
         declared_units_out: int | None = None,
@@ -698,56 +700,34 @@ class Client:
         owner = self.signer.address
         units_in, units_out = _declare_units(payload_input, declared_units_out)
         ctx = await self.chain_context()
-        # The bid, in the atomic units the order signs; the market replaces it below.
-        atomic_in = usd_atomic(rate_in, "rate_in", ctx.decimals)
-        atomic_out = usd_atomic(rate_out, "rate_out", ctx.decimals)
+        # The ceilings, in the atomic units an ask is compared and an order signed in.
+        max_in = usd_atomic(max_rate_in, "max_rate_in", ctx.decimals)
+        max_out = usd_atomic(max_rate_out, "max_rate_out", ctx.decimals)
         model_id = await self._model_id(model)
 
         # -- the recipient, and therefore the container ----------------------
         #
-        # Both order paths converge on one container. The only difference between
-        # them is who the seed is sealed to — a provider's box key, or the
-        # coordinator's verified escrow key for an open order — and that choice
-        # is invisible from outside the wrap.
+        # Every order converges on one container. The only difference is who the
+        # seed is sealed to — a provider's box key, or the coordinator's verified
+        # escrow key for an open order — and that choice is invisible from
+        # outside the wrap.
         #
-        # A pinned order knows its recipient. An unpinned one does not until the
-        # network answers, and the network answers only a *signed* order — so
-        # it asks first with a **probe**: the same terms over a placeholder
-        # commitment, never posted, whose `402` names the clearing candidates.
-        # The client takes the first, seals to it, signs the real order and
-        # challenges again for that order's own quote. Three requests instead of
-        # two, and the bytes still cross the wire exactly once. **The open path
-        # fails closed** inside `_matched_recipient`, before a single byte is
-        # posted.
-        #
-        # **No bid named is the market.** An unsigned probe asks the node for
-        # every live ask ranked; the order then bids the first candidate's own
-        # ask, pinned to it. With `provider=` the probe is pinned too, so the
-        # answer is that provider's ask or nothing.
-        if rate_in is None and rate_out is None:
-            recipient, designated, atomic_in, atomic_out = await self._market(
-                provider, confidential, model, model_id, window, units_in, units_out, ctx,
-            )
-        elif provider is not None:
-            recipient, designated = await self._recipient(provider, confidential)
-        else:
-            probe = self._sign_order(
-                None, 0, payload_input, owner, custom_id, model_id, window,
-                atomic_in, atomic_out, units_in, units_out, ctx,
-            )
-            _, challenge = await self._challenge(
-                probe.vorq, probe.job_id, ctx, probe.terms.expires_at
-            )
-            recipient, designated = await self._matched_recipient(
-                _candidates(challenge), confidential
-            )
+        # The recipient and the rates come from one unsigned probe: the node
+        # names every live ask within the ceilings, ranked, and the order signs
+        # the first candidate's own ask, pinned to it. With `provider=` the probe
+        # is pinned too, so the answer is that provider's ask or nothing. An
+        # order nothing clears rests at its ceilings. **The open path fails
+        # closed** inside `_escrow_recipient`, before a single byte is posted.
+        recipient, designated, atomic_in, atomic_out = await self._market(
+            provider, confidential, model, model_id, window, units_in, units_out,
+            max_in, max_out, ctx,
+        )
         order = self._sign_order(
             recipient, designated, payload_input, owner, custom_id, model_id, window,
             atomic_in, atomic_out, units_in, units_out, ctx,
         )
         container, job_id, vorq = order.container, order.job_id, order.vorq
         expires_at = order.terms.expires_at
-        assert container is not None
 
         # -- phase 1: the terms-only challenge -------------------------------
         #
@@ -824,21 +804,26 @@ class Client:
             status_code=409,
         )
 
-    async def _market(
-        self, provider: int | None, confidential: bool, model: str, model_id: int,
-        window: str, units_in: int, units_out: int, ctx: ChainContext,
-    ) -> tuple[str, int, int, int]:
-        """Seal target, pin and atomic rates for an order that names no bid: the first ask the node ranks.
+    async def _probe(
+        self, provider: int | None, model_id: int, window: str, units_in: int,
+        units_out: int, max_in: int | None, max_out: int | None, ctx: ChainContext,
+    ) -> list[dict]:
+        """The live asks within the ceilings, as the node ranks them.
 
         The market probe is `POST /v1/jobs` with no rates and no signature: it
         commits to nothing, so it costs no wallet prompt, and the node answers
         `402` with the live asks ranked and no quote.
         """
+        body: dict[str, Any] = {
+            "model_id": model_id, "sla_secs": sla_seconds(window), "units_in": units_in,
+            "units_out": units_out, "designated": provider or 0,
+        }
+        if max_in is not None:
+            body["max_rate_in"] = format_usd(max_in, ctx.decimals)
+        if max_out is not None:
+            body["max_rate_out"] = format_usd(max_out, ctx.decimals)
         resp = await self._request(
-            "POST", "/v1/jobs",
-            json={"model_id": model_id, "sla_secs": sla_seconds(window), "units_in": units_in,
-                  "units_out": units_out, "designated": provider or 0},
-            retry=False, allow_statuses=frozenset({402}),
+            "POST", "/v1/jobs", json=body, retry=False, allow_statuses=frozenset({402}),
         )
         if resp.status_code != 402:
             raise VorqError(
@@ -846,14 +831,77 @@ class Client:
                 "naming the candidates is a valid answer to one",
                 type="api_error", status_code=resp.status_code,
             )
-        candidates = _candidates(resp.json())
+        return _candidates(resp.json())
+
+    @staticmethod
+    def _ask(candidate: dict, ctx: ChainContext) -> tuple[int, int]:
+        """A candidate's own ask, in the atomic units an order signs."""
+        pid = candidate["provider_id"]
+        if "rate_in" not in candidate or "rate_out" not in candidate:
+            raise VorqError(
+                f"the node named provider {pid} without its ask, so there is no rate to sign",
+                type="api_error", status_code=402,
+            )
+        try:
+            rate_in = usd_atomic(candidate["rate_in"], "rate_in", ctx.decimals)
+            rate_out = usd_atomic(candidate["rate_out"], "rate_out", ctx.decimals)
+        except ValidationError as exc:
+            raise VorqError(
+                f"the node named provider {pid} with an unreadable ask: {exc}",
+                type="api_error", status_code=402,
+            ) from exc
+        assert rate_in is not None and rate_out is not None
+        return rate_in, rate_out
+
+    async def _resting(
+        self, provider: int | None, confidential: bool, model: str, model_id: int,
+        window: str, units_in: int, units_out: int,
+        max_in: int | None, max_out: int | None, ctx: ChainContext,
+    ) -> tuple[str, int, int, int]:
+        """Seal target, pin and atomic rates for an order no live ask clears: it rests at its ceilings.
+
+        An order signs both rates, so a side with no ceiling takes the market's:
+        the rate of the cheapest live ask for this job, read by a second probe
+        that names no ceiling. With no ceiling on either side, or no live ask to
+        take the unnamed side from, there is nothing to rest at.
+        """
+        if max_in is None or max_out is None:
+            market = [] if max_in is None and max_out is None else await self._probe(
+                provider, model_id, window, units_in, units_out, None, None, ctx,
+            )
+            if not market:
+                by = f"provider {provider} is not" if provider is not None else "no provider is"
+                raise ValidationError(
+                    f"{by} serving {model} in the {window} window right now; nothing was "
+                    "signed. Try another window or model, or pass max_rate_in= and "
+                    "max_rate_out= to post an order that rests until a provider takes it",
+                    type="invalid_request_error",
+                )
+            ask_in, ask_out = self._ask(market[0], ctx)
+            max_in = ask_in if max_in is None else max_in
+            max_out = ask_out if max_out is None else max_out
+        if confidential and provider is None:
+            raise VerificationError(
+                "no provider asks within these ceilings, so the order would rest as an "
+                "escrowed open order — which cannot be an attested channel. Resubmit "
+                "without confidential=True, or raise the ceilings."
+            )
+        recipient, designated = await self._recipient(provider, confidential)
+        return recipient, designated, max_in, max_out
+
+    async def _market(
+        self, provider: int | None, confidential: bool, model: str, model_id: int,
+        window: str, units_in: int, units_out: int,
+        max_in: int | None, max_out: int | None, ctx: ChainContext,
+    ) -> tuple[str, int, int, int]:
+        """Seal target, pin and atomic rates for an order: the first ask within its ceilings, or where it rests."""
+        candidates = await self._probe(
+            provider, model_id, window, units_in, units_out, max_in, max_out, ctx,
+        )
         if not candidates:
-            by = f"provider {provider} is not" if provider is not None else "no provider is"
-            raise ValidationError(
-                f"{by} serving {model} in the {window} window right now; nothing was "
-                "signed. Try another window or model, or pass rate_in= and rate_out= to "
-                "post a bid that rests until a provider takes it",
-                type="invalid_request_error",
+            return await self._resting(
+                provider, confidential, model, model_id, window, units_in, units_out,
+                max_in, max_out, ctx,
             )
         if confidential:
             assert self.verifier is not None  # submit() refuses confidential without one
@@ -871,40 +919,23 @@ class Client:
                 f"the node answered a probe pinned to provider {provider} with provider {pid}",
                 type="api_error", status_code=402,
             )
-        if "rate_in" not in chosen or "rate_out" not in chosen:
+        rate_in, rate_out = self._ask(chosen, ctx)
+        if (max_in is not None and rate_in > max_in) or (max_out is not None and rate_out > max_out):
             raise VorqError(
-                f"the node named provider {pid} without its ask, so there is no rate to bid",
+                f"the node named provider {pid} at an ask above the ceilings the probe set",
                 type="api_error", status_code=402,
             )
-        try:
-            rate_in = usd_atomic(chosen["rate_in"], "rate_in", ctx.decimals)
-            rate_out = usd_atomic(chosen["rate_out"], "rate_out", ctx.decimals)
-        except ValidationError as exc:
-            raise VorqError(
-                f"the node named provider {pid} with an unreadable ask: {exc}",
-                type="api_error", status_code=402,
-            ) from exc
         return chosen["box_key"], pid, rate_in, rate_out
 
     def _sign_order(
-        self, recipient_box_key: str | None, designated: int, payload_input: dict,
+        self, recipient_box_key: str, designated: int, payload_input: dict,
         owner: str, custom_id: str | None, model_id: int, window: str,
         rate_in: int, rate_out: int, units_in: int, units_out: int,
         ctx: ChainContext,
     ) -> _SignedOrder:
-        """Seal (or, for a probe, placeholder) the container and sign the order over it.
-
-        With no recipient this is a **probe**: `c` is 32 random bytes and nothing
-        is sealed. The node checks a challenge's signature and
-        `job_id = keccak(owner ‖ c)` and never its bytes, so a probe is a complete
-        order to challenge with and an impossible one to post — it names no
-        container that exists.
-        """
+        """Seal the container to its recipient and sign the order over it."""
         assert self.signer is not None
-        if recipient_box_key is None:
-            container, c = None, secrets.token_bytes(32)
-        else:
-            container, c = self._seal_container(recipient_box_key, payload_input, owner, custom_id)
+        container, c = self._seal_container(recipient_box_key, payload_input, owner, custom_id)
         job_id = content_job_id(owner, c)
         terms = OrderTerms(
             c=c,
@@ -946,36 +977,6 @@ class Client:
             )
         body = resp.json()
         return self._quote(body, job_id, ctx, expires_at), body
-
-    async def _matched_recipient(
-        self, candidates: list[dict], confidential: bool
-    ) -> tuple[str, int]:
-        """The seal target an unpinned order takes from the challenge's candidates.
-
-        The first candidate, as the node ranked it — or, under ``confidential``,
-        the first whose record attests. An empty list means nothing clears the
-        bid: the order rests as an escrowed open bid, which is the one path
-        ``confidential`` cannot take, so there it is a refusal.
-        """
-        if not candidates:
-            if confidential:
-                raise VerificationError(
-                    "no candidate cleared this bid, so it would rest as an escrowed "
-                    "open order — which cannot be an attested channel. Resubmit "
-                    "without confidential=True, or raise the bid."
-                )
-            return await self._escrow_recipient(), 0
-        if confidential:
-            assert self.verifier is not None  # submit() refuses confidential without one
-            verified = await self.verifier.verify_candidates(candidates)
-            if not verified:
-                raise VerificationError(
-                    f"none of the {len(candidates)} candidate(s) the challenge named "
-                    "verified against the allowlist; nothing was sealed"
-                )
-            candidates = verified
-        chosen = candidates[0]
-        return chosen["box_key"], int(chosen["provider_id"])
 
     def _expires_at(self, window: str) -> int:
         """When the order stops being postable, clamped to the chain's own ceiling.
@@ -1182,11 +1183,10 @@ class Client:
         )
 
     async def _recipient(self, provider: int | None, confidential: bool) -> tuple[str, int]:
-        """Who a **pinned** payload is sealed to, and what ``designated`` says about it.
+        """Who a resting order's payload is sealed to, and what ``designated`` says about it.
 
-        A named provider is sealed to its registry ``box_key``; with no pin the
-        caller reaches this only as the fallback of :meth:`_matched_recipient`,
-        which is the escrow key. ``designated`` is the provider id or ``0`` — the
+        A named provider is sealed to its registry ``box_key``; with no pin it
+        is the escrow key. ``designated`` is the provider id or ``0`` — the
         contract's own sentinel for "any provider", never a null (Q22).
         """
         if provider is not None:
@@ -1216,8 +1216,8 @@ class Client:
     async def _escrow_recipient(self) -> str:
         """The coordinator's **verified** escrow public key, for an open order.
 
-        Reached only when the challenge named no candidate — nothing on the book
-        clears the bid, so it rests. Cached for :data:`KEY_CACHE_TTL`. Fail closed, and this is the whole of
+        Reached only when the probe named no candidate — no live ask is within
+        the ceilings, so the order rests. Cached for :data:`KEY_CACHE_TTL`. Fail closed, and this is the whole of
         Q17: an open order's payload is sealed to this key and to nothing else,
         so a key that cannot be shown to be what it claims raises
         :class:`~vorq.errors.EscrowKeyUnverified` and **nothing is posted**.

@@ -208,7 +208,7 @@ class SealingTransport(httpx.BaseTransport):
         self._base_url = base_url.rstrip("/")
         self._signer = signer
         self._cipher = cipher
-        # Needed for an open order (a bid named, no provider): it seals to the
+        # Needed for an open order (a ceiling no ask is within, no provider): it seals to the
         # coordinator's escrow key, and the native client will not post one it
         # cannot verify (Q17).
         self._verifier = verifier
@@ -316,9 +316,9 @@ class SealingTransport(httpx.BaseTransport):
                 "by the response id."))
         background = body.get("background") is True
         # Everything an order needs that OpenAI's body has no field for: the SLA
-        # window, the bid, and an optional named provider. `rate_in`/`rate_out`
-        # are USD per 1M units as decimal strings; with neither, the order takes
-        # the market (the first ask the node ranks), exactly as `submit` does.
+        # window, the ceilings, and an optional named provider. `max_rate_in` /
+        # `max_rate_out` are USD per 1M units as decimal strings; a side left out
+        # has no ceiling, exactly as on `submit`.
         vorq_block = body.get("vorq") or {}
         sla = vorq_block.get("sla") or "1h"
         payload = {k: v for k, v in body.items()
@@ -328,8 +328,8 @@ class SealingTransport(httpx.BaseTransport):
 
         async def go(client: Client) -> dict:
             handle = await client.submit(model, payload, sla=sla,
-                                         rate_in=vorq_block.get("rate_in"),
-                                         rate_out=vorq_block.get("rate_out"),
+                                         max_rate_in=vorq_block.get("max_rate_in"),
+                                         max_rate_out=vorq_block.get("max_rate_out"),
                                          provider=vorq_block.get("provider"))
             if background:
                 job = handle._job or {"id": handle.id, "status": "queued"}
@@ -440,10 +440,10 @@ def sealing_http_client(*, base_url: str = DEFAULT_BASE_URL, signer: Signer | No
                         inner_transport: httpx.AsyncBaseTransport | None = None) -> httpx.Client:
     """An ``httpx.Client`` for ``OpenAI(http_client=...)`` with E2E-sealed payloads.
 
-    Pass ``verifier=vorq.Verifier(base_url)`` to submit **open** orders (a bid
-    named in the ``vorq`` block with no provider): without one the native client
-    underneath fails closed on the escrow key. A call that names no bid takes the
-    market, pinned to a provider, and needs no verifier.
+    Pass ``verifier=vorq.Verifier(base_url)`` to submit **open** orders (a
+    ceiling in the ``vorq`` block that no provider is within, with no provider
+    named): without one the native client underneath fails closed on the escrow
+    key. A call that names no ceiling is pinned to a provider and needs no verifier.
     """
     transport = SealingTransport(base_url=base_url, signer=signer, cipher=cipher,
                                  verifier=verifier, timeout=timeout,

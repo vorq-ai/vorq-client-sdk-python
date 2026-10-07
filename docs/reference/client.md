@@ -36,7 +36,7 @@ raises `ValueError`.
 | `signer` | Overrides the wallet signer, for example with a KMS-backed signer. See [`Signer`](./signing.md#signer). |
 | `cipher` | Overrides the result cipher. An explicit cipher always wins. Otherwise a `WalletSigner` derives one, and any other client uses `VORQ_CIPHER_KEY` if it is set. |
 | `transport` | Replaces the underlying `httpx` transport: a proxy, a custom pool or a test double. |
-| `verifier` | A [`vorq.Verifier`](./verifier.md). Required to post an [open bid](../concepts/bids-and-matching.md#open-bids), including every line of a batch without `providers`, and for `confidential=True`. |
+| `verifier` | A [`vorq.Verifier`](./verifier.md). Required to post an [open order](../concepts/bids-and-matching.md#resting-orders), including every line of a batch without `providers`, and for `confidential=True`. |
 | `gateway` | The storage gateway result bytes are read from. See [Reading results](#reading-results). |
 
 The client is an async context manager (`async with vorq.Client(...) as client:`); otherwise
@@ -77,8 +77,8 @@ handle = await client.submit(
     model: str,
     input: str | dict,
     sla: str = "batch",
-    rate_in: str | Decimal | None = None,
-    rate_out: str | Decimal | None = None,
+    max_rate_in: str | Decimal | None = None,
+    max_rate_out: str | Decimal | None = None,
     provider: int | None = None,
     validate_params: bool = True,
     *,
@@ -91,14 +91,23 @@ handle = await client.submit(
 Seals, signs, pays for and posts one job to `POST /v1/jobs`, for any modality. The flow is
 described in [Bids and matching](../concepts/bids-and-matching.md#how-an-order-is-matched).
 
+```python
+# One ceiling, no provider: never more than $0.60 per 1M input tokens.
+handle = await client.submit(model="moonshotai/kimi-k3", input="Hello", max_rate_in="0.6")
+```
+
+A ceiling protects you from being overcharged: the order signs the matched provider's ask, and
+never a rate above the ceiling on that side. Set it too low and no provider matches: the order
+[rests](../concepts/bids-and-matching.md#resting-orders) and may expire without being served.
+
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `model` | — | A model id as listed by [`models.list()`](#modelslist). The order signs the catalog's numeric `model_id`, so an unlisted id raises `ValidationError`. |
 | `input` | — | A `str` is sent as `{"input": str}`. A `dict` is the model's own input object and is sent as-is. |
 | `sla` | `"batch"` | `"async"` (`"1h"`) or `"batch"` (`"24h"`). Other `<n>h`, `<n>m` or `<n>s` strings are passed through for the network to validate. |
-| `rate_in` | `None` | Your bid for the input side in USD per 1,000,000 input units, as a decimal string (`"0.05"`) or a `Decimal`. With both rates `None`, the order takes the [market](../concepts/bids-and-matching.md#no-bid-named): the first provider the coordinator ranks, at its own ask. With only one `None`, that side bids zero. An `int` or `float`, or more fraction digits than the payment token's decimals, raises `ValidationError`. |
-| `rate_out` | `None` | Your bid for the output side, same unit. |
-| `provider` | `None` | Pins a provider by registry id and seals to its registered key. A provider that publishes no key raises `VerificationError`. With no rates named, the bid is this provider's ask, and `ValidationError` is raised when it is not live for the model. |
+| `max_rate_in` | `None` | The most the order pays for the input side, in USD per 1,000,000 input units, as a decimal string (`"0.05"`) or a `Decimal`. `None` is no ceiling on that side. The order signs the ask of the first provider within the ceilings; when none is, it [rests](../concepts/bids-and-matching.md#resting-orders). An `int` or `float`, or more fraction digits than the payment token's decimals, raises `ValidationError`. |
+| `max_rate_out` | `None` | The most it pays for the output side, same unit. |
+| `provider` | `None` | Pins a provider by registry id: only its ask is considered, and a resting order is sealed to its registered key. A provider that publishes no key raises `VerificationError`. With no ceiling named, `ValidationError` is raised when it is not live for the model. |
 | `validate_params` | `True` | Check a `dict` input against the model's published schema first. See [Local param validation](#local-param-validation). |
 | `confidential` | `False` | Seal only to a provider whose attestation verifies. Requires `verifier=`. See [`Verifier`](./verifier.md#confidential-submissions). |
 | `units_out` | `None` | Overrides the declared output units, zero included. Must be a non-negative `int`. See [Units](./units.md). |

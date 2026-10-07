@@ -73,9 +73,9 @@ protocol and gas fees.
 - `vorq.Client()` talks to the VORQ coordinator at `https://api.vorq.co` and signs with
   `VORQ_WALLET_KEY`.
 - `model` must be an id from `await client.models.list()`.
-- With no bid named, `submit` asks the coordinator for the market in the 24-hour window
-  (`sla="batch"`) and bids the first provider's own ask. To name your own price, pass `rate_in`
-  and `rate_out`; see [Bids and matching](./concepts/bids-and-matching.md).
+- `submit` asks the coordinator for the market in the 24-hour window (`sla="batch"`) and signs
+  the first provider's own ask. To cap what you pay, pass `max_rate_in` and `max_rate_out`; see
+  [Bids and matching](./concepts/bids-and-matching.md).
 - `handle.result()` polls until the job settles, for up to the job's SLA window.
 
 ## Open the cabinet with MetaMask

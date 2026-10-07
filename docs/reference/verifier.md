@@ -78,6 +78,6 @@ recognized, and only in `mock` mode, so in `structural` mode every provider is r
 | --- | --- |
 | The client has no `verifier` | `ValidationError`, before any request. |
 | No candidate verified, or a pinned `provider=` failed | `VerificationError`. A failed pin is never replaced by another provider. |
-| The challenge named no candidate | `VerificationError`. A resting order is sealed to the escrow key, not an attested provider; submit without `confidential=True` to rest as an open bid. |
+| The probe named no candidate | `VerificationError`. A resting order is sealed to the escrow key, not an attested provider; submit without `confidential=True` to rest as an open order. |
 
 In every case the refusal happens before the payload is sealed.

@@ -29,16 +29,20 @@ Line rules, all checked before anything is sealed (violations raise `ValidationE
 - `body.model` is required.
 - `url` is `/v1/responses` (the default) or `/v1/embeddings`, and every line uses the same one.
 - `custom_id` is optional, 1–64 characters and unique in the batch. It travels sealed.
-- `rate_in`, `rate_out` and `units_out` in `body` set the line's order terms; the rest of `body`
-  is the model input. Rates are USD per 1M units, as decimal strings (`"0.05"`) or `Decimal`;
-  an `int` or `float` is refused.
+- `max_rate_in`, `max_rate_out` and `units_out` in `body` set the line's order terms; the rest
+  of `body` is the model input. The ceilings are USD per 1M units, as decimal strings (`"0.05"`)
+  or `Decimal`, each optional; an `int` or `float` is refused.
 - An empty batch is refused.
 
-Lines with neither rate are **planned**: one `POST /v1/batches` with no file sends, per model,
-the line count and summed units, and the coordinator answers which providers take how many lines
-at which ask. No provider gets more lines than its on-chain capacity leaves free. Each such line
-bids its provider's ask and is pinned to it. If a model's lines do not all fit in the window,
-`ValidationError` is raised and nothing is signed.
+Every line is **planned**: one `POST /v1/batches` with no file sends, per model and pair of
+ceilings, the line count and summed units, and the coordinator answers which providers within
+the ceilings take how many lines at which ask. No provider gets more lines than its on-chain
+capacity leaves free. Each planned line signs its provider's ask and is pinned to it.
+
+A line the plan cannot place **rests** at its ceilings, spread by `providers`. A side with no
+ceiling rests at the market rate, the cheapest live ask's, read by one more plan. If lines with
+no ceiling at all do not all fit in the window, or there is no live ask to take a market rate
+from, `ValidationError` is raised and nothing is signed.
 
 Then every line is sealed, signed and paid for in your process. The fees on top of each line's
 cap are read once, from one quote. The file is uploaded (`POST /v1/files`, `purpose=batch`) and

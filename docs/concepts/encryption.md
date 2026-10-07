@@ -15,7 +15,7 @@ The client wraps your input in an envelope, `{v, owner, result_key, input}` plus
 2. The encryption key is derived from the seed and your wallet address
    (HKDF-SHA256), and the envelope is encrypted under it.
 3. The seed is sealed (a libsodium sealed box) to the recipient: the matched provider's
-   registered key, or, for an [open bid](./bids-and-matching.md#open-bids), the coordinator's
+   registered key, or, for an [open order](./bids-and-matching.md#resting-orders), the coordinator's
    escrow key.
 
 Because the key is derived with the owner's address, a seed copied onto someone else's order
@@ -34,7 +34,7 @@ the client knows the job id before it sends anything.
 | --- | --- |
 | Coordinator | The order terms (model id, SLA, rates, unit counts, designated provider, expiry), your address and the ciphertext. |
 | Matched provider | The opened envelope: your input, your address and your result key. |
-| Coordinator escrow (open bids only) | The seed, which it releases to the provider that claims the order. |
+| Coordinator escrow (open orders only) | The seed, which it releases to the provider that claims the order. |
 | Anyone who knows the result's content address | The sealed result bytes, which only your result key opens. |
 
 Batch `metadata` is the one field you send that is stored in plaintext.
@@ -54,7 +54,7 @@ authorization: the name is the only way to find them, and only your key opens th
 
 The client verifies the keys it seals to when it has a [`Verifier`](../reference/verifier.md):
 
-- **Escrow key.** Before sealing an open bid, the client checks that the coordinator's
+- **Escrow key.** Before sealing an open order, the client checks that the coordinator's
   announced escrow key is fresh and bound to its evidence. There is no fallback: an escrow key
   that doesn't verify means nothing is posted.
 - **Provider attestation.** `submit(..., confidential=True)` seals only to a provider whose

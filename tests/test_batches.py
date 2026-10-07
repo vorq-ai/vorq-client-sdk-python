@@ -28,8 +28,8 @@ needs_wallet = pytest.mark.skipif(
 
 MODEL = "deepseek-ai/deepseek-v4-pro:fp8"
 
-# Every batch line names its own bid: an unpriced one is refused.
-PRICE = {"rate_in": "30", "rate_out": "90"}
+# The ceilings every line of the shared fixture names.
+PRICE = {"max_rate_in": "30", "max_rate_out": "90"}
 
 REQUESTS = [
     {
@@ -92,8 +92,8 @@ def batch_router(state, *, batch=None, files=None, blobs=None, fee_bps: int | No
                  allocation=None):
     """Everything a batch submit and drain reads, captured into ``state``.
 
-    ``allocation`` is what a plan names per model; unset, provider 1 takes every
-    line at 0.001/0.002.
+    ``allocation`` is what a plan names per entry — a list, or a function of the
+    entry; unset, provider 1 takes every line at 0.001/0.002.
     """
     files = files or {}
     blobs = blobs or {}
@@ -121,7 +121,8 @@ def batch_router(state, *, batch=None, files=None, blobs=None, fee_bps: int | No
             state.setdefault("plans", []).append(ask)
             return json_response(402, {"plan": [
                 {"model_id": m["model_id"], "lines": m["lines"],
-                 "allocation": allocation if allocation is not None else [
+                 "allocation": allocation(m) if callable(allocation) else
+                 allocation if allocation is not None else [
                      {"provider_id": 1, "box_key": BOX_PUBLIC, "rate_in": "0.001",
                       "rate_out": "0.002", "lines": m["lines"]}]}
                 for m in ask["models"]]})
@@ -299,9 +300,9 @@ class TestSubmit:
             await client.batches.submit(REQUESTS, providers=[7])
         await client.aclose()
 
-    async def test_lines_designate_the_named_providers_round_robin(self):
+    async def test_resting_lines_designate_the_named_providers_round_robin(self):
         state = {}
-        client = _sealing_client(batch_router(state))
+        client = _sealing_client(batch_router(state, allocation=[]))
 
         await client.batches.submit(REQUESTS, providers=[7, 12])
 
@@ -380,17 +381,20 @@ class TestSubmit:
         ]))
         unpriced = [{**r, "body": {k: v for k, v in r["body"].items() if k not in PRICE}}
                     for r in REQUESTS]
-        with pytest.raises(ValidationError, match="can take 2 of the 3 unpriced"):
+        with pytest.raises(ValidationError, match="can take 2 of the 3 .* lines without both ceilings"):
             await client.batches.submit(unpriced)
         assert "quotes" not in state and "upload" not in state
         await client.aclose()
 
-    async def test_interleaved_priced_and_unpriced_lines_keep_their_own_terms(self):
+    async def test_interleaved_planned_and_resting_lines_keep_their_own_terms(self):
         state = {}
-        client = _sealing_client(batch_router(state, allocation=[
+        taken = [
             {"provider_id": 7, "box_key": BOX_PUBLIC, "rate_in": "0.000005", "rate_out": "0.000009", "lines": 1},
             {"provider_id": 8, "box_key": BOX_PUBLIC, "rate_in": "0.000006", "rate_out": "0.000009", "lines": 1},
-        ]))
+        ]
+        client = _sealing_client(batch_router(
+            state, allocation=lambda entry: [] if "max_rate_in" in entry else taken,
+        ))
         unpriced = {**REQUESTS[0], "body": {k: v for k, v in REQUESTS[0]["body"].items()
                                             if k not in PRICE}}
         lines = [{**unpriced, "custom_id": "u1"}, {**REQUESTS[1], "custom_id": "p"},
@@ -398,26 +402,60 @@ class TestSubmit:
         await client.batches.submit(lines, providers=[9])
 
         [plan] = state["plans"]
-        assert [m["lines"] for m in plan["models"]] == [2]
+        assert [m["lines"] for m in plan["models"]] == [2, 1]
         rows = _uploaded_lines(state["upload"])
         assert [(r["designated"], r["rate_in"]) for r in rows] == [
-            (7, "0.000005"), (9, PRICE["rate_in"]), (8, "0.000006"),
+            (7, "0.000005"), (9, PRICE["max_rate_in"]), (8, "0.000006"),
         ]
         await client.aclose()
 
-    async def test_priced_lines_are_not_planned(self):
+    async def test_lines_with_ceilings_are_planned_within_them_and_sign_the_ask(self):
         state = {}
         client = _sealing_client(batch_router(state))
         await client.batches.submit(REQUESTS, providers=[7])
-        assert "plans" not in state
+        [plan] = state["plans"]
+        assert [(m["lines"], m["max_rate_in"], m["max_rate_out"]) for m in plan["models"]] == [
+            (3, "30", "90"),
+        ]
+        rows = _uploaded_lines(state["upload"])
+        assert {(r["designated"], r["rate_in"], r["rate_out"]) for r in rows} == {(1, "0.001", "0.002")}
+        await client.aclose()
+
+    async def test_a_line_with_one_ceiling_rests_at_it_and_the_market_rate(self):
+        """Nobody is within the input ceiling, so the line rests: a second plan,
+        naming no ceiling, supplies the rate for the side that named none."""
+        state = {}
+        market = [{"provider_id": 7, "box_key": BOX_PUBLIC, "rate_in": "0.000005",
+                   "rate_out": "0.000009", "lines": 1}]
+        client = _sealing_client(batch_router(
+            state, allocation=lambda entry: [] if "max_rate_in" in entry else market,
+        ))
+        body = {k: v for k, v in REQUESTS[0]["body"].items() if k not in PRICE}
+        await client.batches.submit(
+            [{**REQUESTS[0], "body": {**body, "max_rate_in": "0.000001"}}], providers=[9],
+        )
+        within, unbounded = state["plans"]
+        assert within["models"][0]["max_rate_in"] == "0.000001"
+        assert "max_rate_in" not in unbounded["models"][0]
+        [row] = _uploaded_lines(state["upload"])
+        assert (row["designated"], row["rate_in"], row["rate_out"]) == (9, "0.000001", "0.000009")
+        await client.aclose()
+
+    async def test_a_planned_ask_above_a_ceiling_is_refused(self):
+        state = {}
+        client = _sealing_client(batch_router(state))
+        body = {k: v for k, v in REQUESTS[0]["body"].items() if k not in PRICE}
+        with pytest.raises(VorqError, match="above the ceilings"):
+            await client.batches.submit([{**REQUESTS[0], "body": {**body, "max_rate_out": "0.001"}}])
+        assert "upload" not in state
         await client.aclose()
 
     @pytest.mark.parametrize("rate", [30, 0.5, "1e3"])
     async def test_a_line_rate_that_is_not_usd_is_refused_before_anything_is_sealed(self, rate):
         state = {}
         client = _sealing_client(batch_router(state))
-        lines = [{**REQUESTS[0], "body": {**REQUESTS[0]["body"], "rate_in": rate}}]
-        with pytest.raises(ValidationError, match=r'line 1: rate_in.*USD per 1M units'):
+        lines = [{**REQUESTS[0], "body": {**REQUESTS[0]["body"], "max_rate_in": rate}}]
+        with pytest.raises(ValidationError, match=r'line 1: max_rate_in.*USD per 1M units'):
             await client.batches.submit(lines, providers=[7])
         assert not {"plans", "quotes", "upload"} & set(state)
         await client.aclose()

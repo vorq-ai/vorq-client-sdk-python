@@ -74,7 +74,7 @@ def _emulator_handler(state: dict, *, opaque: bool = False, media: bool = False)
         if method == "POST" and path == "/v1/jobs":
             body = req_body(request)
             if "auth_sig" not in body:      # phase 1: terms-only → 402 challenge
-                # A market probe (0/0) names provider 3 with this emulator's key.
+                # A market probe names provider 3 with this emulator's key.
                 market = "rate_in" not in body and "rate_out" not in body
                 candidates = ([{"provider_id": 3, "box_key": provider_box,
                                 "rate_in": "0.000007", "rate_out": "0.000011"}] if market else None)
@@ -203,17 +203,12 @@ class _StubVerifier:
 
 
 @needs_wallet
-def test_the_vorq_block_carries_the_bid_into_the_signed_order():
-    """A stock caller has to be able to say what it will pay.
-
-    The order signs `rate_in` and `rate_out`, and a bid below the provider's
-    published ask is posted and never claimed — so a surface with no way to
-    express one can only submit at zero, which every provider on a live network
-    declines. The failure is invisible from a mocked emulator, which settles
-    whatever it is given: it looks like a claim path that never fires.
+def test_the_vorq_block_carries_the_ceilings_and_the_order_signs_the_ask():
+    """A stock caller has to be able to say the most it will pay.
 
     `vorq` is where a stock caller puts what OpenAI's body has no field for, and
-    it already carries `sla` and `provider`. The bid belongs beside them.
+    it already carries `sla` and `provider`. The ceilings belong beside them:
+    the order signs the ask of the provider within them, never the ceiling.
     """
     from vorq import sealing_http_client
 
@@ -224,20 +219,41 @@ def test_the_vorq_block_carries_the_bid_into_the_signed_order():
     )
     resp = client.post("/v1/responses", json={
         "model": "deepseek-ai/deepseek-v4-pro:fp8", "input": "hello",
-        "vorq": {"sla": "1h", "provider": 3, "rate_in": "0.000007", "rate_out": "0.000011"},
+        "vorq": {"sla": "1h", "provider": 3, "max_rate_in": "0.00001", "max_rate_out": "0.00002"},
     })
 
     assert resp.status_code == 200, resp.text
     terms = state["submitted"]
     # USD strings on the wire, as all money is.
     assert (terms["rate_in"], terms["rate_out"]) == ("0.000007", "0.000011")
-    # And the bid is not in the payload: a rate is an order term, not a prompt
+    # And the ceiling is not in the payload: it is an order term, not a prompt
     # param, so it must not have been swept into the sealed body instead.
     assert "rate_in" not in json.dumps(state["envelope"])
 
 
 @needs_wallet
-def test_a_bid_that_is_not_a_usd_string_is_refused_before_anything_is_submitted():
+def test_an_input_ceiling_alone_in_the_vorq_block_signs_the_ask_on_both_sides():
+    """Only `max_rate_in`: the output side takes the provider's own rate, not zero."""
+    from vorq import sealing_http_client
+
+    state: dict = {}
+    resp = sealing_http_client(
+        base_url="http://coordinator.test",
+        inner_transport=httpx.MockTransport(_emulator_handler(state)),
+    ).post("/v1/responses", json={
+        "model": "deepseek-ai/deepseek-v4-pro:fp8", "input": "hello",
+        "vorq": {"sla": "1h", "max_rate_in": "0.00001"},
+    })
+
+    assert resp.status_code == 200, resp.text
+    terms = state["submitted"]
+    assert (terms["rate_in"], terms["rate_out"], int(terms["designated"])) == (
+        "0.000007", "0.000011", 3,
+    )
+
+
+@needs_wallet
+def test_a_ceiling_that_is_not_a_usd_string_is_refused_before_anything_is_submitted():
     """A JSON number is ambiguous between USD and atomic units; the rate is USD per 1M units."""
     from vorq import sealing_http_client
 
@@ -247,7 +263,7 @@ def test_a_bid_that_is_not_a_usd_string_is_refused_before_anything_is_submitted(
         inner_transport=httpx.MockTransport(_emulator_handler(state)),
     ).post("/v1/responses", json={
         "model": "deepseek-ai/deepseek-v4-pro:fp8", "input": "hello",
-        "vorq": {"sla": "1h", "provider": 3, "rate_in": 7, "rate_out": "0.000011"},
+        "vorq": {"sla": "1h", "provider": 3, "max_rate_in": 7, "max_rate_out": "0.000011"},
     })
 
     assert resp.status_code == 400
@@ -269,7 +285,8 @@ def test_an_open_order_is_refused_without_a_verifier_and_posts_with_one():
     from vorq import sealing_http_client
 
     body = {"model": "deepseek-ai/deepseek-v4-pro:fp8", "input": "hello",
-            "vorq": {"sla": "1h", "rate_in": "0.000007", "rate_out": "0.000011"}}
+            # Under provider 3's ask on both sides, so the order rests.
+            "vorq": {"sla": "1h", "max_rate_in": "0.000001", "max_rate_out": "0.000002"}}
 
     blind: dict = {}
     refused = sealing_http_client(
