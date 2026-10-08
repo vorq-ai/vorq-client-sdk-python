@@ -15,7 +15,7 @@ db.save_job(id=handle.id, status="submitted")   # before any await on the result
 ```
 
 `handle.result()` keeps the calling coroutine waiting until the job settles, up to 24 hours on
-the `batch` tier. A service shouldn't assume it outlives that window.
+the `batch` tier (usually minutes to a few hours). A service shouldn't assume it outlives that window.
 
 ## Bound the wait
 

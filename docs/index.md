@@ -12,7 +12,7 @@ A submission returns a job id right away. The network completes the job within i
 and you collect the result by polling:
 
 - **async** tier: up to 1 hour.
-- **batch** tier: up to 24 hours.
+- **batch** tier: usually minutes to a few hours, 24 hours at most.
 
 ## Who it is for
 

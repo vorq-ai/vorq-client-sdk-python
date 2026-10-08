@@ -19,7 +19,7 @@ batch = await client.batches.submit(
 | Parameter | Meaning |
 | --- | --- |
 | `requests` | OpenAI batch lines, or a path to a JSONL file of them. Each line is `{"custom_id", "method", "url", "body": {"model", ...}}`. |
-| `completion_window` | `"async"` / `"1h"` or `"batch"` / `"24h"`, like `submit(sla=...)`. |
+| `completion_window` | `"async"` / `"1h"` or `"batch"` / `"24h"`, like `submit(sla=...)`. A `"24h"` batch usually takes minutes to a few hours; 24 hours is the maximum. |
 | `providers` | Provider ids to assign priced lines to, round-robin. Without it, every priced line is an open order sealed to the coordinator's verified escrow key, which requires a client built with `verifier=`. Lines with no rates ignore it and go where the plan puts them. |
 | `metadata` | Stored in plaintext on the batch record. |
 | `validate_params` | Check each line's input against its model's schema, as `submit` does. |

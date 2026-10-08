@@ -104,7 +104,7 @@ never a rate above the ceiling on that side. Set it too low and no provider matc
 | --- | --- | --- |
 | `model` | — | A model id as listed by [`models.list()`](#modelslist). The order signs the catalog's numeric `model_id`, so an unlisted id raises `ValidationError`. |
 | `input` | — | A `str` is sent as `{"input": str}`. A `dict` is the model's own input object and is sent as-is. |
-| `sla` | `"batch"` | `"async"` (`"1h"`) or `"batch"` (`"24h"`). Other `<n>h`, `<n>m` or `<n>s` strings are passed through for the network to validate. |
+| `sla` | `"batch"` | `"async"` (`"1h"`) or `"batch"` (`"24h"`). A `"batch"` job usually takes minutes to a few hours; 24 hours is the maximum. Other `<n>h`, `<n>m` or `<n>s` strings are passed through for the network to validate. |
 | `max_rate_in` | `None` | The most the order pays for the input side, in USD per 1,000,000 input units, as a decimal string (`"0.05"`) or a `Decimal`. `None` is no ceiling on that side. The order signs the ask of the first provider within the ceilings; when none is, it [rests](../concepts/bids-and-matching.md#resting-orders). An `int` or `float`, or more fraction digits than the payment token's decimals, raises `ValidationError`. |
 | `max_rate_out` | `None` | The most it pays for the output side, same unit. |
 | `provider` | `None` | Pins a provider by registry id: only its ask is considered, and a resting order is sealed to its registered key. A provider that publishes no key raises `VerificationError`. With no ceiling named, `ValidationError` is raised when it is not live for the model. |

@@ -76,7 +76,8 @@ protocol and gas fees.
 - `submit` asks the coordinator for the market in the 24-hour window (`sla="batch"`) and signs
   the first provider's own ask. To cap what you pay, pass `max_rate_in` and `max_rate_out`; see
   [Bids and matching](./concepts/bids-and-matching.md).
-- `handle.result()` polls until the job settles, for up to the job's SLA window.
+- `handle.result()` polls until the job settles, for up to the job's SLA window. A `batch`
+  job usually takes minutes to a few hours; 24 hours is the maximum.
 
 ## Open the cabinet with MetaMask
 

@@ -7,7 +7,8 @@ Async Python client for the VORQ inference exchange.
 `vorq` submits inference jobs to a VORQ coordinator and reads back their results. Every
 submission is sealed in your process before it is sent, so only the provider that runs the job
 can read the prompt. A submission returns a job id right away, and the network completes the job
-within its SLA window: up to 1 hour on the `async` tier, up to 24 hours on the `batch` tier.
+within its SLA window: up to 1 hour on the `async` tier, up to 24 hours on the `batch` tier
+(usually minutes to a few hours).
 
 ## Features
 

@@ -71,7 +71,7 @@ it, and pays less when a provider asks less. Set it too low and no provider matc
 ## Create a response in the background
 
 Use `background=True` whenever the wait might outlive your connection, for example on the
-`"24h"` window:
+`"24h"` window (usually minutes to a few hours, 24 hours at most):
 
 ```python
 import time

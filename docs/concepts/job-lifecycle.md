@@ -30,7 +30,7 @@ ask whether its job landed instead of posting it twice.
 | `batch` (`"24h"`) | up to 24 hours | offline and bulk work |
 
 Both tiers work the same way; the tier only sets the completion window. The window is a
-maximum, and jobs usually finish sooner. The window is signed into the order.
+maximum, and jobs usually finish sooner: a `batch` job typically takes minutes to a few hours. The window is signed into the order.
 
 An order also carries an expiry: the SLA window plus a settlement margin (one hour by default),
 capped at 24 hours from submission. An order no provider claims by then ends as `expired`.
