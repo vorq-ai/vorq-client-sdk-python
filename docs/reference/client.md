@@ -92,8 +92,8 @@ Seals, signs, pays for and posts one job to `POST /v1/jobs`, for any modality. T
 described in [Bids and matching](../concepts/bids-and-matching.md#how-an-order-is-matched).
 
 ```python
-# One ceiling, no provider: never more than $0.60 per 1M input tokens.
-handle = await client.submit(model="moonshotai/kimi-k3", input="Hello", max_rate_in="0.6")
+# One ceiling, no provider: never more than $0.28 per 1M input tokens.
+handle = await client.submit(model="z-ai/glm-5.3", input="Hello", max_rate_in="0.28")
 ```
 
 A ceiling protects you from being overcharged: the order signs the matched provider's ask, and

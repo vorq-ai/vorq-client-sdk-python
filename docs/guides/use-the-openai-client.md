@@ -37,7 +37,7 @@ client = OpenAI(
 
 ```python
 resp = client.responses.create(
-    model="moonshotai/kimi-k3",
+    model="z-ai/glm-5.3",
     input="Say hello.",
     extra_body={"vorq": {"sla": "batch"}},
 )
@@ -52,9 +52,9 @@ The `vorq` block carries the order terms the Responses schema has no field for: 
 
 ```python
 resp = client.responses.create(
-    model="moonshotai/kimi-k3",
+    model="z-ai/glm-5.3",
     input="Say hello.",
-    extra_body={"vorq": {"sla": "batch", "max_rate_in": "0.6"}},
+    extra_body={"vorq": {"sla": "batch", "max_rate_in": "0.28"}},
 )
 ```
 
@@ -77,7 +77,7 @@ Use `background=True` whenever the wait might outlive your connection, for examp
 import time
 
 resp = client.responses.create(
-    model="moonshotai/kimi-k3",
+    model="z-ai/glm-5.3",
     input="Summarize the attached notes in three bullet points.",
     background=True,
     extra_body={"vorq": {"sla": "batch"}},

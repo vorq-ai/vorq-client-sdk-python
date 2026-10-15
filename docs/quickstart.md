@@ -44,7 +44,7 @@ import vorq
 async def main():
     async with vorq.Client() as client:
         handle = await client.submit(
-            model="moonshotai/kimi-k3",
+            model="z-ai/glm-5.3",
             input="Summarize the plot of Hamlet in three bullet points.",
             sla="batch",
         )

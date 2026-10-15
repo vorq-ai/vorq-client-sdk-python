@@ -13,9 +13,9 @@ Pass OpenAI-style batch lines, or the path to a JSONL file of them:
 ```python
 batch = await client.batches.submit([
     {"custom_id": "en", "url": "/v1/responses",
-     "body": {"model": "moonshotai/kimi-k3", "input": "Hello", "max_rate_in": "0.6"}},
+     "body": {"model": "z-ai/glm-5.3", "input": "Hello", "max_rate_in": "0.28"}},
     {"custom_id": "fr", "url": "/v1/responses",
-     "body": {"model": "moonshotai/kimi-k3", "input": "Bonjour", "max_rate_in": "0.6"}},
+     "body": {"model": "z-ai/glm-5.3", "input": "Bonjour", "max_rate_in": "0.28"}},
 ], "batch")
 print("batch:", batch.id)   # persist this, with batch.job_ids
 ```
