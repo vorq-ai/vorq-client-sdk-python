@@ -117,7 +117,7 @@ def provider_record(provider_id: int, box_key: str = BOX_PUBLIC, **over) -> dict
     """`GET /evm/providers/{id}` — the registry record, as the index projects it."""
     record = {
         "provider_id": provider_id, "provider": provider_id,
-        "operator": "0x1111111111111111111111111111111111111111",
+        "operator": "0x1111111111111111111111111111111111111111", "name": None,
         "box_key": box_key, "evidence": None, "listed": True, "reputation": 1000,
         "allow_all_models": True, "allowed_models": [], "capacity": 8, "active_jobs": 0,
         "as_of_block": 128,

@@ -4,6 +4,20 @@ All notable changes to the `vorq` package are documented here. The format follow
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Breaking:** `batches.submit()`'s `providers=` is an allow-list. Lines are planned only onto
+  the listed providers, cheapest first; `provider` in a line's body restricts that line to
+  exactly that provider and overrides `providers=`. A restricted line never rests: if any cannot
+  be placed, the whole batch raises `ValidationError` before anything is signed. An empty list is
+  refused. Resting lines are no longer spread round-robin: an unrestricted line the plan cannot
+  place rests as an open order, and a client without `verifier=` is refused before anything is
+  sealed.
+- A batch reads each distinct provider's registry record and each model's id once per submit,
+  not once per line.
+
 ## [0.1.0rc3] — 2026-10-07
 
 ### Changed

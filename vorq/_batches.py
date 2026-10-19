@@ -33,10 +33,11 @@ from ._results import (
 )
 from . import _sla
 from ._sla import batch_poll_interval, normalize_sla, sla_seconds
-from .errors import BatchFailed, ValidationError, VorqError, WaitTimeout
+from ._terms import UINT32_MAX
+from .errors import BatchFailed, EscrowKeyUnverified, ValidationError, VorqError, WaitTimeout
 
 if TYPE_CHECKING:
-    from ._client import Client, SealedLine
+    from ._client import Client, SealedLine, _SealMemo
 
 _TERMINAL = {"completed", "failed", "expired", "cancelled"}
 
@@ -76,8 +77,50 @@ def _endpoint_of(line: dict, n: int) -> str:
     return url
 
 
-#: What lines are planned together by: the model and the two atomic ceilings.
-_Key = tuple[str, Union[int, None], Union[int, None]]
+def _provider_id_of(value: Any, field: str) -> int:
+    """A provider id: a positive JSON integer within the order's ``uint32``.
+
+    ``0`` is the contract's sentinel for "any provider", so it is refused rather
+    than read as an id: an unrestricted line is one that names no provider, not
+    one that names zero.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= UINT32_MAX:
+        raise ValidationError(
+            f"{field} must be a provider id, an integer in [1, {UINT32_MAX}], got {value!r}",
+            type="invalid_request_error",
+        )
+    return value
+
+
+def _allow_list_of(value: Any) -> tuple[int, ...] | None:
+    """The batch's allow-list, ascending, or ``None`` for none: a non-empty list of
+    unique provider ids."""
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValidationError(
+            f"providers must be a non-empty list of provider ids, got {value!r}",
+            type="invalid_request_error",
+        )
+    ids: set[int] = set()
+    for k, entry in enumerate(value):
+        pid = _provider_id_of(entry, f"providers[{k}]")
+        if pid in ids:
+            raise ValidationError(
+                f"providers names provider {pid} twice", type="invalid_request_error"
+            )
+        ids.add(pid)
+    return tuple(sorted(ids))
+
+
+def _providers_named(ids: tuple[int, ...]) -> str:
+    """``provider 7``, or ``providers 3, 7``: how a refusal names an allowed set."""
+    return f"{'provider' if len(ids) == 1 else 'providers'} {', '.join(map(str, ids))}"
+
+
+#: What lines are planned together by: the model, the two atomic ceilings and the
+#: allowed providers (``None`` for unrestricted).
+_Key = tuple[str, int | None, int | None, tuple[int, ...] | None]
 
 
 class Batches:
@@ -114,14 +157,18 @@ class Batches:
         network cannot take in full raises
         :class:`~vorq.errors.ValidationError` with nothing signed.
 
-        ``providers`` is how the resting lines spread. Given a list, they are designated
-        round-robin across it — one batch running across several operators, each
-        able to open only its own lines. Given nothing, each is an **open
-        order**: sealed to the coordinator's verified escrow key and claimable by
-        any provider that clears the terms, which spreads further than a fixed
-        list can. That path requires a client built with ``verifier=``, exactly
-        as a single open ``submit`` does — an escrow key that cannot be checked
-        is not one this SDK will seal to.
+        ``providers=`` is an allow-list: every line is planned only onto those
+        providers, cheapest first. A line's ``provider`` (in its body, beside the
+        ceilings) restricts that line to exactly that one, overriding the list. A
+        restricted line **never rests**: if its allowed providers cannot take it —
+        their asks do not clear its ceilings, or they lack the capacity — the
+        whole batch is refused before anything is sealed or signed, naming the
+        model, how many lines could not be placed and the providers allowed. An
+        unrestricted line the plan cannot place rests as an **open order**: sealed
+        to the coordinator's verified escrow key and claimable by any provider
+        that clears the terms. That path requires a client built with
+        ``verifier=``, exactly as a single open ``submit`` does — an escrow key
+        that cannot be checked is not one this SDK will seal to.
 
         ``custom_id`` is optional (1–64 characters, unique within the batch) and
         **travels sealed inside its line's container**, coming back inside the
@@ -142,6 +189,7 @@ class Batches:
                 "(or pass signer=/cipher=)",
                 type="invalid_request_error",
             )
+        batch_list = _allow_list_of(providers)
         lines = _load_requests(requests)
         if not lines:
             raise ValidationError("the batch contains no requests", type="invalid_request_error")
@@ -153,6 +201,8 @@ class Batches:
         seen: set[str] = set()
         by_model: dict[str, list[int]] = {}
         endpoints: set[str] = set()
+        #: Each line's allowed providers: its own ``provider``, else the batch's list, else none.
+        allowed: list[tuple[int, ...] | None] = []
         for i, line in enumerate(lines):
             n = i + 1
             custom_id = line.get("custom_id")
@@ -177,6 +227,10 @@ class Batches:
                 usd_arg(body.get(key), f"line {n}: {key}")
             endpoints.add(_endpoint_of(line, n))
             by_model.setdefault(body["model"], []).append(i)
+            pin = body.get("provider")
+            allowed.append(
+                batch_list if pin is None else (_provider_id_of(pin, f"line {n}: provider"),)
+            )
 
         if len(endpoints) > 1:
             raise ValidationError(
@@ -198,7 +252,24 @@ class Batches:
 
         # -- the plan: who takes each line, at which rates --------------------
         ctx = await client.chain_context()
-        picks = await self._plan(lines, window, ctx.decimals)
+        from ._client import _SealMemo
+
+        #: One read per distinct provider record and model id for the whole submit.
+        memo = _SealMemo()
+        picks = await self._plan(lines, allowed, window, ctx.decimals, memo)
+        if client.verifier is None and any(pid is None for pid, _, _ in picks):
+            # An unrestricted line the plan could not place rests as an open order,
+            # sealed to the coordinator's escrow key, which this client has no
+            # way to verify. Refused here, before a byte is sealed, rather than
+            # at the first such line's seal.
+            raise EscrowKeyUnverified(
+                "no provider is within the ceilings of every unrestricted line, so some "
+                "would rest as open orders, which are sealed to the coordinator's "
+                "escrow key — and this client has no verifier to check that key with. "
+                "Build the client with verifier=vorq.Verifier(...), or restrict the "
+                "lines: batches.submit(..., providers=[N, ...]), or \"provider\" on a "
+                "line's body."
+            )
 
         # -- seal every line ------------------------------------------------
         sealed: list["SealedLine"] = []
@@ -210,10 +281,10 @@ class Batches:
             model = body.pop("model")
             body.pop("max_rate_in", None)
             body.pop("max_rate_out", None)
+            body.pop("provider", None)
             units_out = body.pop("units_out", None)
-            provider, rate_in, rate_out = picks[i]
-            if provider is None:  # not planned: it rests
-                provider = _provider_for(providers, i)
+            # The planned provider, or None: an unrestricted line resting open.
+            pid, rate_in, rate_out = picks[i]
             sealed.append(
                 await client._seal_line(
                     model=model,
@@ -222,10 +293,11 @@ class Batches:
                     url=endpoint,
                     rate_in=rate_in,
                     rate_out=rate_out,
-                    provider=provider,
+                    provider=pid,
                     units_out=units_out,
                     custom_id=line.get("custom_id"),
                     ctx=ctx,
+                    memo=memo,
                 )
             )
 
@@ -250,18 +322,28 @@ class Batches:
         return handle
 
     async def _plan(
-        self, lines: list[dict], window: str, decimals: int
+        self,
+        lines: list[dict],
+        allowed: list[tuple[int, ...] | None],
+        window: str,
+        decimals: int,
+        memo: "_SealMemo",
     ) -> list[tuple[int | None, int, int]]:
         """Provider and atomic rates for every line, from the coordinator's plan.
 
-        One ``POST /v1/batches`` with no file: per model and pair of ceilings, the
-        line count and the summed units. The node answers which providers within
-        the ceilings take how many lines, never past a provider's on-chain
-        capacity, and a placed line signs its provider's ask. A line left over
-        rests, with no provider (``None``), at its ceilings; a side with no
+        One ``POST /v1/batches`` with no file: per model, pair of ceilings and set
+        of allowed providers, the line count and the summed units, a restricted
+        entry naming its set as ``providers``. The node answers which providers
+        within the ceilings take how many lines, never past a provider's on-chain
+        capacity, and only ever allowed ones for a restricted entry; a placed line
+        signs its provider's ask.
+
+        A restricted line left over refuses the batch: it never rests. An
+        unrestricted one rests open (``None``) at its ceilings; a side with no
         ceiling rests at the market rate, read by one more plan that names none.
-        A line with no ceiling at all cannot rest, so a batch that leaves one
-        over is refused before anything is signed.
+        An unrestricted line with no ceiling at all cannot rest, so a batch that
+        leaves one over is refused too. Every refusal lands before anything is
+        signed.
         """
         from ._client import _declare_units
 
@@ -274,6 +356,7 @@ class Batches:
                 body["model"],
                 usd_atomic(body.get("max_rate_in"), f"line {i + 1}: max_rate_in", decimals),
                 usd_atomic(body.get("max_rate_out"), f"line {i + 1}: max_rate_out", decimals),
+                allowed[i],
             )
             groups.setdefault(key, []).append(i)
             u_in, u_out = _declare_units(_input_of(line), body.get("units_out"))
@@ -287,15 +370,19 @@ class Batches:
             """Per entry ``(key, lines)``: the ``(provider, rate_in, rate_out, lines)`` shares the node plans."""
             models = []
             for key, count in entries:
-                model, max_in, max_out = key if ceilings else (key[0], None, None)
+                model, max_in, max_out, permitted = (
+                    key if ceilings else (key[0], None, None, key[3])
+                )
                 entry: dict[str, Any] = {
-                    "model_id": await client._model_id(model), "lines": count,
+                    "model_id": await memo.model_id(client, model), "lines": count,
                     "units_in": units[key][0], "units_out": units[key][1],
                 }
                 if max_in is not None:
                     entry["max_rate_in"] = format_usd(max_in, decimals)
                 if max_out is not None:
                     entry["max_rate_out"] = format_usd(max_out, decimals)
+                if permitted is not None:
+                    entry["providers"] = list(permitted)
                 models.append(entry)
             resp = await client._request(
                 "POST", "/v1/batches", json={"completion_window": window, "models": models},
@@ -308,7 +395,7 @@ class Batches:
                     "entry per entry asked", type="api_error", status_code=resp.status_code,
                 )
             shares: list[list[tuple[int, int, int, int]]] = []
-            for entry in plan:
+            for (key, _), entry in zip(entries, plan):
                 allocation = entry.get("allocation") if isinstance(entry, dict) else None
                 if not isinstance(allocation, list):
                     raise VorqError("a plan entry carries no allocation list",
@@ -326,13 +413,19 @@ class Batches:
                 except (KeyError, TypeError, ValueError, VorqError) as exc:
                     raise VorqError(f"a plan allocation is unreadable: {exc}",
                                     type="api_error", status_code=402) from exc
+                for pid, *_ in shares[-1]:
+                    if key[3] is not None and pid not in key[3]:
+                        raise VorqError(
+                            f"the node planned provider {pid} for lines restricted to "
+                            f"{_providers_named(key[3])}", type="api_error", status_code=402,
+                        )
             return shares
 
         keys = list(groups)
         picks: dict[int, tuple[int | None, int, int]] = {}
         left: dict[_Key, list[int]] = {}
         for key, shares in zip(keys, await allocations([(k, len(groups[k])) for k in keys])):
-            _, max_in, max_out = key
+            _, max_in, max_out, _ = key
             queue = iter(groups[key])
             for pid, rate_in, rate_out, count in shares:
                 if (max_in is not None and rate_in > max_in) or (
@@ -348,6 +441,19 @@ class Batches:
             if rest:
                 left[key] = rest
 
+        # -- a restricted line never rests: one left over refuses the batch
+        for key, indexes in left.items():
+            if key[3] is None:
+                continue
+            raise ValidationError(
+                f"{len(indexes)} of the {len(groups[key])} {key[0]} lines restricted to "
+                f"{_providers_named(key[3])} cannot be placed in the {window} window: their "
+                "asks do not clear the lines' ceilings or they lack the capacity, and a "
+                "restricted line never rests, so nothing was signed. Raise the ceilings, "
+                "allow more providers, or try the other window",
+                type="invalid_request_error",
+            )
+
         def refuse(key: _Key) -> ValidationError:
             model, placed = key[0], len(groups[key]) - len(left[key])
             return ValidationError(
@@ -358,7 +464,8 @@ class Batches:
                 type="invalid_request_error",
             )
 
-        # -- the lines that rest: at their ceilings, the market rate where there is none
+        # -- the unrestricted lines that rest open: at their ceilings, the market
+        # rate where there is none
         for key in left:
             if key[1] is None and key[2] is None:
                 raise refuse(key)
@@ -371,7 +478,7 @@ class Batches:
                     raise refuse(key)
                 market[key] = shares[0][1], shares[0][2]
         for key, indexes in left.items():
-            _, max_in, max_out = key
+            _, max_in, max_out, _ = key
             ask_in, ask_out = market.get(key, (0, 0))
             for i in indexes:
                 picks[i] = (
@@ -433,15 +540,8 @@ def _input_of(line: dict) -> dict:
     return {
         k: v
         for k, v in line["body"].items()
-        if k not in ("model", "max_rate_in", "max_rate_out", "units_out")
+        if k not in ("model", "max_rate_in", "max_rate_out", "units_out", "provider")
     }
-
-
-def _provider_for(providers: list[int] | None, index: int) -> int | None:
-    """Round-robin, or ``None`` for an open order sealed to the escrow key."""
-    if not providers:
-        return None
-    return providers[index % len(providers)]
 
 
 async def _dispatch(cb: Callable | None, arg: Any, tasks: list[asyncio.Task]) -> None:

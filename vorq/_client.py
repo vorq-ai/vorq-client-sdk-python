@@ -8,7 +8,7 @@ import json
 import os
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
@@ -245,6 +245,25 @@ def _cap(terms: "OrderTerms") -> int:
     """
     scaled = terms.rate_in * terms.units_in + terms.rate_out * terms.units_out
     return max(1, -(-scaled // RATE_SCALE))
+
+
+@dataclass
+class _SealMemo:
+    """What a batch reads once per key rather than once per line: each distinct
+    provider's registry record and each model's id, for one submit."""
+
+    records: dict[int, dict] = field(default_factory=dict)
+    model_ids: dict[str, int] = field(default_factory=dict)
+
+    async def record(self, client: "Client", provider: int) -> dict:
+        if provider not in self.records:
+            self.records[provider] = await client._provider_record(provider)
+        return self.records[provider]
+
+    async def model_id(self, client: "Client", model: str) -> int:
+        if model not in self.model_ids:
+            self.model_ids[model] = await client._model_id(model)
+        return self.model_ids[model]
 
 
 @dataclass(frozen=True)
@@ -886,7 +905,7 @@ class Client:
                 "escrowed open order — which cannot be an attested channel. Resubmit "
                 "without confidential=True, or raise the ceilings."
             )
-        recipient, designated = await self._recipient(provider, confidential)
+        recipient, designated = await self._recipient(provider, confidential, _SealMemo())
         return recipient, designated, max_in, max_out
 
     async def _market(
@@ -1182,7 +1201,9 @@ class Client:
             type="invalid_request_error",
         )
 
-    async def _recipient(self, provider: int | None, confidential: bool) -> tuple[str, int]:
+    async def _recipient(
+        self, provider: int | None, confidential: bool, memo: _SealMemo
+    ) -> tuple[str, int]:
         """Who a resting order's payload is sealed to, and what ``designated`` says about it.
 
         A named provider is sealed to its registry ``box_key``; with no pin it
@@ -1190,7 +1211,7 @@ class Client:
         contract's own sentinel for "any provider", never a null (Q22).
         """
         if provider is not None:
-            record = await self._provider_record(provider)
+            record = await memo.record(self, provider)
             if confidential:
                 assert self.verifier is not None  # submit() refuses confidential without one
                 # An unverified pin is a refusal and never a substitution: this
@@ -1441,6 +1462,7 @@ class Client:
         units_out: int | None,
         custom_id: str | None,
         ctx: ChainContext,
+        memo: _SealMemo,
     ) -> "SealedLine":
         """One batch input line: a complete sealed submission, ready to be filed.
 
@@ -1455,12 +1477,12 @@ class Client:
         assert self.signer is not None and self.cipher is not None
         owner = self.signer.address
         units_in, declared_out = _declare_units(payload_input, units_out)
-        recipient, designated = await self._recipient(provider, False)
+        recipient, designated = await self._recipient(provider, False, memo)
         container, c = self._seal_container(recipient, payload_input, owner, custom_id)
         job_id = content_job_id(owner, c)
         terms = OrderTerms(
             c=c,
-            model_id=await self._model_id(model),
+            model_id=await memo.model_id(self, model),
             sla_secs=sla_seconds(window),
             rate_in=rate_in,
             rate_out=rate_out,

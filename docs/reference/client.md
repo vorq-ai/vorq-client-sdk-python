@@ -36,7 +36,7 @@ raises `ValueError`.
 | `signer` | Overrides the wallet signer, for example with a KMS-backed signer. See [`Signer`](./signing.md#signer). |
 | `cipher` | Overrides the result cipher. An explicit cipher always wins. Otherwise a `WalletSigner` derives one, and any other client uses `VORQ_CIPHER_KEY` if it is set. |
 | `transport` | Replaces the underlying `httpx` transport: a proxy, a custom pool or a test double. |
-| `verifier` | A [`vorq.Verifier`](./verifier.md). Required to post an [open order](../concepts/bids-and-matching.md#resting-orders), including every line of a batch without `providers`, and for `confidential=True`. |
+| `verifier` | A [`vorq.Verifier`](./verifier.md). Required to post an [open order](../concepts/bids-and-matching.md#resting-orders), including every unrestricted batch line that rests, and for `confidential=True`. |
 | `gateway` | The storage gateway result bytes are read from. See [Reading results](#reading-results). |
 
 The client is an async context manager (`async with vorq.Client(...) as client:`); otherwise

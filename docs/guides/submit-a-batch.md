@@ -30,9 +30,9 @@ served.
 In each line:
 
 - `url` is `/v1/responses` (the default) or `/v1/embeddings`. One batch uses one endpoint.
-- `body.model` is required. `max_rate_in`, `max_rate_out` and `units_out` in `body` set that
-  line's order terms; everything else in `body` is the model input. The ceilings are USD per 1M
-  units, as decimal strings (`"0.05"`) or `Decimal`, and each is optional.
+- `body.model` is required. `max_rate_in`, `max_rate_out`, `units_out` and `provider` in `body`
+  set that line's order terms; everything else in `body` is the model input. The ceilings are
+  USD per 1M units, as decimal strings (`"0.05"`) or `Decimal`, and each is optional.
 - Before sealing, the client asks the coordinator for a plan: which providers within each
   line's ceilings take how many lines, and at which ask. A provider is never given more lines
   than its on-chain capacity leaves free, and each planned line signs its provider's ask and is
@@ -46,12 +46,15 @@ In each line:
 
 ## Choose who serves it
 
-- **Planned lines** go where the plan puts them; `providers` does not apply to them.
-- **Resting lines without `providers`** are open orders sealed to the coordinator's escrow key,
-  which any provider clearing its terms can claim. The client must be built with
-  `verifier=vorq.Verifier(base_url)`.
-- **Resting lines with `providers=[3, 7]`** are assigned round-robin to those provider ids, and
-  each line is sealed to its provider's key.
+- **Restricted lines** are planned only onto the providers allowed: `providers=[3, 7]` on
+  `submit` is an allow-list for every line, cheapest first, and `"provider": 7` in a line's
+  `body` restricts that line to exactly that provider, overriding the list. A restricted line
+  never rests: if the allowed providers' asks do not clear its ceilings, or they lack the
+  capacity, the whole batch raises `ValidationError` before anything is signed, naming the
+  model, how many lines could not be placed and the allowed providers.
+- **Unrestricted lines** go where the plan puts them. One the plan cannot place is an open order
+  sealed to the coordinator's escrow key, which any provider clearing its terms can claim. The
+  client must be built with `verifier=vorq.Verifier(base_url)`.
 
 ## Collect the results
 

@@ -20,7 +20,7 @@ batch = await client.batches.submit(
 | --- | --- |
 | `requests` | OpenAI batch lines, or a path to a JSONL file of them. Each line is `{"custom_id", "method", "url", "body": {"model", ...}}`. |
 | `completion_window` | `"async"` / `"1h"` or `"batch"` / `"24h"`, like `submit(sla=...)`. A `"24h"` batch usually takes minutes to a few hours; 24 hours is the maximum. |
-| `providers` | Provider ids to assign priced lines to, round-robin. Without it, every priced line is an open order sealed to the coordinator's verified escrow key, which requires a client built with `verifier=`. Lines with no rates ignore it and go where the plan puts them. |
+| `providers` | An allow-list for every line without its own `body.provider`: those lines are planned only onto these providers, cheapest first. Non-empty, unique, each an integer from 1 to 4294967295. |
 | `metadata` | Stored in plaintext on the batch record. |
 | `validate_params` | Check each line's input against its model's schema, as `submit` does. |
 
@@ -29,20 +29,32 @@ Line rules, all checked before anything is sealed (violations raise `ValidationE
 - `body.model` is required.
 - `url` is `/v1/responses` (the default) or `/v1/embeddings`, and every line uses the same one.
 - `custom_id` is optional, 1–64 characters and unique in the batch. It travels sealed.
-- `max_rate_in`, `max_rate_out` and `units_out` in `body` set the line's order terms; the rest
-  of `body` is the model input. The ceilings are USD per 1M units, as decimal strings (`"0.05"`)
-  or `Decimal`, each optional; an `int` or `float` is refused.
+- `max_rate_in`, `max_rate_out`, `units_out` and `provider` in `body` set the line's order
+  terms; the rest of `body` is the model input. The ceilings are USD per 1M units, as decimal
+  strings (`"0.05"`) or `Decimal`, each optional; an `int` or `float` is refused. `provider` is
+  a provider id, an integer from 1 to 4294967295: the line is planned onto that provider only,
+  overriding `providers=`.
+- `providers=` must be a non-empty list of unique provider ids.
 - An empty batch is refused.
 
-Every line is **planned**: one `POST /v1/batches` with no file sends, per model and pair of
-ceilings, the line count and summed units, and the coordinator answers which providers within
-the ceilings take how many lines at which ask. No provider gets more lines than its on-chain
-capacity leaves free. Each planned line signs its provider's ask and is pinned to it.
+Every line is **planned**: one `POST /v1/batches` with no file sends, per model, pair of
+ceilings and set of allowed providers, the line count and summed units; a restricted entry names
+its set as `providers`. The coordinator answers which providers within the ceilings take how
+many lines at which ask, cheapest first, and plans a restricted entry onto its allowed providers
+only. No provider gets more lines than its on-chain capacity leaves free. Each planned line signs
+its provider's ask and is designated to it.
 
-A line the plan cannot place **rests** at its ceilings, spread by `providers`. A side with no
-ceiling rests at the market rate, the cheapest live ask's, read by one more plan. If lines with
-no ceiling at all do not all fit in the window, or there is no live ask to take a market rate
-from, `ValidationError` is raised and nothing is signed.
+A **restricted** line (`providers=`, or `body.provider`) never rests. If the plan leaves any
+over, because the allowed providers' asks do not clear the ceilings or they lack the capacity,
+the whole batch raises `ValidationError` before anything is sealed or signed, naming the model,
+how many lines could not be placed and the allowed providers.
+
+An **unrestricted** line the plan cannot place **rests** at its ceilings as an open order sealed
+to the coordinator's verified escrow key, which requires a client built with `verifier=` (else
+`EscrowKeyUnverified`, before anything is sealed). A side with no ceiling rests at the market
+rate, the cheapest live ask's, read by one more plan. If lines with no ceiling at all do not all
+fit in the window, or there is no live ask to take a market rate from, `ValidationError` is
+raised and nothing is signed.
 
 Then every line is sealed, signed and paid for in your process. The fees on top of each line's
 cap are read once, from one quote. The file is uploaded (`POST /v1/files`, `purpose=batch`) and

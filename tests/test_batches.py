@@ -16,10 +16,10 @@ import pytest
 from vorq._crypto import SealedBoxCipher, WalletSigner
 from vorq._money import parse_usd
 from vorq._results import JobError, TextResult
-from vorq.errors import BatchFailed, ValidationError, VorqError, WaitTimeout
+from vorq.errors import BatchFailed, EscrowKeyUnverified, ValidationError, VorqError, WaitTimeout
 
 from .conftest import fake_cid, json_keys, json_response, make_client
-from .test_client import BOX_PUBLIC, _open_complete, auth_router, quote_body
+from .test_client import BOX_PUBLIC, _open_complete, auth_router, escrow_verifier, quote_body
 
 needs_wallet = pytest.mark.skipif(
     not os.environ.get("VORQ_WALLET_KEY") or not os.environ.get("VORQ_CIPHER_KEY"),
@@ -93,7 +93,8 @@ def batch_router(state, *, batch=None, files=None, blobs=None, fee_bps: int | No
     """Everything a batch submit and drain reads, captured into ``state``.
 
     ``allocation`` is what a plan names per entry — a list, or a function of the
-    entry; unset, provider 1 takes every line at 0.001/0.002.
+    entry; unset, provider 1 — or the lowest id of the entry's ``providers`` —
+    takes every line at 0.001/0.002.
     """
     files = files or {}
     blobs = blobs or {}
@@ -123,7 +124,7 @@ def batch_router(state, *, batch=None, files=None, blobs=None, fee_bps: int | No
                 {"model_id": m["model_id"], "lines": m["lines"],
                  "allocation": allocation(m) if callable(allocation) else
                  allocation if allocation is not None else [
-                     {"provider_id": 1, "box_key": BOX_PUBLIC, "rate_in": "0.001",
+                     {"provider_id": min(m.get("providers", [1])), "box_key": BOX_PUBLIC, "rate_in": "0.001",
                       "rate_out": "0.002", "lines": m["lines"]}]}
                 for m in ask["models"]]})
         if path == "/v1/batches" and method == "POST":
@@ -300,14 +301,170 @@ class TestSubmit:
             await client.batches.submit(REQUESTS, providers=[7])
         await client.aclose()
 
-    async def test_resting_lines_designate_the_named_providers_round_robin(self):
+    async def test_a_batch_list_is_planned_only_onto_its_providers(self):
+        state = {}
+        client = _sealing_client(batch_router(state, allocation=lambda entry: [
+            {"provider_id": 3, "box_key": BOX_PUBLIC, "rate_in": "0.001", "rate_out": "0.002",
+             "lines": 1},
+            {"provider_id": 7, "box_key": BOX_PUBLIC, "rate_in": "0.002", "rate_out": "0.002",
+             "lines": entry["lines"] - 1}]))
+        await client.batches.submit(REQUESTS, providers=[7, 3])
+
+        [plan] = state["plans"]
+        # One entry, naming the allowed set.
+        assert [(m["lines"], m["providers"]) for m in plan["models"]] == [(3, [3, 7])]
+        rows = _uploaded_lines(state["upload"])
+        assert [(r["designated"], r["rate_in"]) for r in rows] == [
+            (3, "0.001"), (7, "0.002"), (7, "0.002"),
+        ]
+        await client.aclose()
+
+    async def test_each_distinct_provider_record_is_read_once_per_submit(self):
+        def submit_counting(lines):
+            reads: list[str] = []
+            router = batch_router(state := {})
+
+            def counting(request):
+                reads.append(request.url.path)
+                return router(request)
+
+            return _sealing_client(counting), reads, state
+
+        body = {k: v for k, v in REQUESTS[0]["body"].items() if k not in PRICE}
+        lines = [{"body": {**body, "provider": pid}} for pid in (3, 7, 3, 7, 3)]
+        client, reads, state = submit_counting(lines)
+        await client.batches.submit(lines)
+        assert sorted(p for p in reads if p.startswith("/evm/providers/")) == [
+            "/evm/providers/3", "/evm/providers/7",
+        ]
+        assert [r["designated"] for r in _uploaded_lines(state["upload"])] == [3, 7, 3, 7, 3]
+        # And the catalog reads do not grow with the file: the same for one line
+        # as for five — the model id is resolved once and shared too.
+        one, one_reads, _ = submit_counting(lines[:1])
+        await one.batches.submit(lines[:1])
+        assert reads.count("/v1/models") == one_reads.count("/v1/models")
+        await client.aclose()
+        await one.aclose()
+
+    async def test_a_line_s_own_provider_overrides_the_batch_list(self):
+        state = {}
+        client = _sealing_client(batch_router(state))
+        body = {k: v for k, v in REQUESTS[0]["body"].items() if k not in PRICE}
+        lines = [{**REQUESTS[0], "body": body},
+                 {**REQUESTS[1], "body": {**body, "provider": 3}}]
+        await client.batches.submit(lines, providers=[7])
+
+        [plan] = state["plans"]
+        assert [(m["lines"], m["providers"]) for m in plan["models"]] == [(1, [7]), (1, [3])]
+        rows = _uploaded_lines(state["upload"])
+        assert [r["designated"] for r in rows] == [7, 3]
+        # `provider` is a routing key: it never reaches the sealed model input.
+        assert "provider" not in _open_line(rows[1])["input"]
+        await client.aclose()
+
+    async def test_a_restricted_line_its_providers_do_not_clear_refuses_with_no_market_replan(self):
         state = {}
         client = _sealing_client(batch_router(state, allocation=[]))
+        sealed: list = []
+        client._seal_line = lambda **kw: sealed.append(kw)  # never reached
+        body = {k: v for k, v in REQUESTS[0]["body"].items() if k not in PRICE}
+        with pytest.raises(ValidationError, match=(
+            r"^1 of the 1 .* lines restricted to provider 9 cannot be placed in the 24h "
+            r"window: .*nothing was signed"
+        )):
+            await client.batches.submit(
+                [{**REQUESTS[0], "body": {**body, "max_rate_in": "0.000001"}}], providers=[9],
+            )
+        # A restricted line never rests, so no second plan asks for a market rate.
+        [plan] = state["plans"]
+        assert plan["models"][0]["providers"] == [9]
+        assert sealed == [] and "quotes" not in state and "upload" not in state
+        await client.aclose()
 
-        await client.batches.submit(REQUESTS, providers=[7, 12])
+    async def test_partly_placed_restricted_lines_refuse_the_whole_batch(self):
+        """The list takes one of its three lines and the line pinned to provider 1
+        beside them is placed in full: nothing is sealed, signed or uploaded."""
+        state = {}
+        client = _sealing_client(batch_router(state, allocation=lambda entry: [
+            {"provider_id": entry["providers"][0], "box_key": BOX_PUBLIC, "rate_in": "0.001",
+             "rate_out": "0.002", "lines": 1 if entry["providers"] == [3, 7] else entry["lines"]}]))
+        sealed: list = []
+        client._seal_line = lambda **kw: sealed.append(kw)  # never reached
+        body = {k: v for k, v in REQUESTS[0]["body"].items() if k not in PRICE}
+        lines = [{"body": {**body, "provider": 1}}] + [{"body": body}] * 3
+        with pytest.raises(ValidationError, match=(
+            r"^2 of the 3 .* lines restricted to providers 3, 7 cannot be placed in the 24h window"
+        )):
+            await client.batches.submit(lines, providers=[7, 3])
+        assert sealed == []
+        assert not {"quotes", "upload", "create"} & set(state)
+        await client.aclose()
 
-        designated = [line["designated"] for line in _uploaded_lines(state["upload"])]
-        assert designated == [7, 12, 7]
+    async def test_a_restricted_line_with_no_ceiling_its_providers_cannot_take_is_refused(self):
+        state = {}
+        client = _sealing_client(batch_router(state, allocation=[]))
+        body = {k: v for k, v in REQUESTS[0]["body"].items() if k not in PRICE}
+        with pytest.raises(ValidationError,
+                           match="^1 of the 1 .* lines restricted to provider 9 cannot be placed"):
+            await client.batches.submit([{**REQUESTS[0], "body": {**body, "provider": 9}}])
+        assert "quotes" not in state and "upload" not in state
+        await client.aclose()
+
+    async def test_a_plan_that_moves_a_restricted_line_outside_its_list_is_refused(self):
+        state = {}
+        client = _sealing_client(batch_router(state, allocation=[
+            {"provider_id": 4, "box_key": BOX_PUBLIC, "rate_in": "0.001", "rate_out": "0.002",
+             "lines": 3}]))
+        with pytest.raises(VorqError,
+                           match="planned provider 4 for lines restricted to providers 3, 9"):
+            await client.batches.submit(REQUESTS, providers=[9, 3])
+        lines = [{**r, "body": {**r["body"], "provider": 9}} for r in REQUESTS]
+        with pytest.raises(VorqError, match="planned provider 4 for lines restricted to provider 9"):
+            await client.batches.submit(lines, providers=[4])
+        assert "quotes" not in state and "upload" not in state
+        await client.aclose()
+
+    @pytest.mark.parametrize("bad", [0, -1, 1.5, "7", True, 2**32])
+    async def test_a_line_provider_that_is_not_an_id_is_refused_naming_the_line(self, bad):
+        state = {}
+        client = _sealing_client(batch_router(state))
+        lines = [REQUESTS[0], {**REQUESTS[1], "body": {**REQUESTS[1]["body"], "provider": bad}}]
+        with pytest.raises(ValidationError, match=r"line 2: provider must be a provider id"):
+            await client.batches.submit(lines)
+        assert not {"plans", "quotes", "upload"} & set(state)
+        await client.aclose()
+
+    @pytest.mark.parametrize("bad, match", [
+        ([], r"^providers must be a non-empty list of provider ids"),
+        (7, r"^providers must be a non-empty list of provider ids"),
+        ("7", r"^providers must be a non-empty list of provider ids"),
+        ({3, 7}, r"^providers must be a non-empty list of provider ids"),
+        *[([3, bad], r"^providers\[1\] must be a provider id, an integer in \[1, 4294967295\]")
+          for bad in (0, -1, 1.5, "7", True, None, 2**32)],
+        ([3, 7, 3], r"^providers names provider 3 twice"),
+    ])
+    async def test_a_providers_list_that_is_not_unique_provider_ids_is_refused(self, bad, match):
+        state = {}
+        client = _sealing_client(batch_router(state))
+        with pytest.raises(ValidationError, match=match):
+            await client.batches.submit(REQUESTS, providers=bad)
+        # Refused before anything is read, sealed or signed.
+        assert not {"plans", "quotes", "upload"} & set(state)
+        await client.aclose()
+
+    async def test_an_open_resting_line_without_a_verifier_is_refused_before_sealing(self):
+        state = {}
+        client = _sealing_client(batch_router(state, allocation=[]))
+        with pytest.raises(EscrowKeyUnverified, match="no verifier to check that key with"):
+            await client.batches.submit(REQUESTS)
+        assert "quotes" not in state and "upload" not in state
+        await client.aclose()
+
+    async def test_an_open_resting_line_with_a_verifier_rests_open(self):
+        state = {}
+        client = _sealing_client(batch_router(state, allocation=[]), verifier=escrow_verifier())
+        await client.batches.submit(REQUESTS)
+        assert [r["designated"] for r in _uploaded_lines(state["upload"])] == [0, 0, 0]
         await client.aclose()
 
     async def test_the_handle_lists_the_job_ids_in_input_order(self):
@@ -394,25 +551,27 @@ class TestSubmit:
         ]
         client = _sealing_client(batch_router(
             state, allocation=lambda entry: [] if "max_rate_in" in entry else taken,
-        ))
+        ), verifier=escrow_verifier())
         unpriced = {**REQUESTS[0], "body": {k: v for k, v in REQUESTS[0]["body"].items()
                                             if k not in PRICE}}
         lines = [{**unpriced, "custom_id": "u1"}, {**REQUESTS[1], "custom_id": "p"},
                  {**unpriced, "custom_id": "u2"}]
-        await client.batches.submit(lines, providers=[9])
+        await client.batches.submit(lines)
 
+        # Nobody is within the priced line's ceilings, so it rests open at them;
+        # the unpriced lines around it are planned normally.
         [plan] = state["plans"]
-        assert [m["lines"] for m in plan["models"]] == [2, 1]
+        assert [(m["lines"], m.get("providers")) for m in plan["models"]] == [(2, None), (1, None)]
         rows = _uploaded_lines(state["upload"])
         assert [(r["designated"], r["rate_in"]) for r in rows] == [
-            (7, "0.000005"), (9, PRICE["max_rate_in"]), (8, "0.000006"),
+            (7, "0.000005"), (0, PRICE["max_rate_in"]), (8, "0.000006"),
         ]
         await client.aclose()
 
     async def test_lines_with_ceilings_are_planned_within_them_and_sign_the_ask(self):
         state = {}
         client = _sealing_client(batch_router(state))
-        await client.batches.submit(REQUESTS, providers=[7])
+        await client.batches.submit(REQUESTS)
         [plan] = state["plans"]
         assert [(m["lines"], m["max_rate_in"], m["max_rate_out"]) for m in plan["models"]] == [
             (3, "30", "90"),
@@ -429,16 +588,16 @@ class TestSubmit:
                    "rate_out": "0.000009", "lines": 1}]
         client = _sealing_client(batch_router(
             state, allocation=lambda entry: [] if "max_rate_in" in entry else market,
-        ))
+        ), verifier=escrow_verifier())
         body = {k: v for k, v in REQUESTS[0]["body"].items() if k not in PRICE}
         await client.batches.submit(
-            [{**REQUESTS[0], "body": {**body, "max_rate_in": "0.000001"}}], providers=[9],
+            [{**REQUESTS[0], "body": {**body, "max_rate_in": "0.000001"}}],
         )
         within, unbounded = state["plans"]
         assert within["models"][0]["max_rate_in"] == "0.000001"
         assert "max_rate_in" not in unbounded["models"][0]
         [row] = _uploaded_lines(state["upload"])
-        assert (row["designated"], row["rate_in"], row["rate_out"]) == (9, "0.000001", "0.000009")
+        assert (row["designated"], row["rate_in"], row["rate_out"]) == (0, "0.000001", "0.000009")
         await client.aclose()
 
     async def test_a_planned_ask_above_a_ceiling_is_refused(self):
