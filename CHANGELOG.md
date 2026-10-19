@@ -4,7 +4,15 @@ All notable changes to the `vorq` package are documented here. The format follow
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+Every release bumps the patch version (`0.2.0`, `0.2.1`, …), so `vorq~=0.2.0` takes each one
+and a plain `pip install -U vorq` always gets the newest. A breaking change bumps the minor
+(`0.3.0`).
+
 ## [Unreleased]
+
+## [0.2.0] — 2026-10-19
+
+The first stable release.
 
 ### Changed
 
