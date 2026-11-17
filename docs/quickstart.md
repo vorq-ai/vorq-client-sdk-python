@@ -3,10 +3,9 @@ title: Quickstart
 description: Install the vorq package, set your wallet key and run your first text job.
 ---
 
-> **VORQ runs on the Base Sepolia testnet.** Jobs are paid in test USDC, which is free. Fund
-> your wallet before step 3: open [faucet.circle.com](https://faucet.circle.com), pick **USDC**
-> and **Base Sepolia**, paste your wallet address and send. No ETH is needed: the coordinator
-> pays the gas.
+> **VORQ runs on Base.** Jobs are paid in USDC on Base. Fund your wallet before step 3: buy or
+> withdraw USDC to the Base network, or bridge it. No ETH is needed: the coordinator pays the
+> gas.
 
 This page takes you from an empty environment to a finished text job.
 
@@ -84,19 +83,19 @@ protocol and gas fees.
 The cabinet at [vorq.co/app](https://vorq.co/app) shows your jobs, results and spending. To use
 it with the wallet from step 2:
 
-1. **Add Base Sepolia.** In MetaMask, open the network selector, then **Add network → Add a
-   network manually**, and fill in:
-   - Network name: `Base Sepolia`
-   - RPC URL: `https://sepolia.base.org`
-   - Chain ID: `84532`
+1. **Switch to Base.** In MetaMask, open the network selector and pick **Base**. If it is not
+   listed, choose **Add network → Add a network manually** and fill in:
+   - Network name: `Base`
+   - RPC URL: `https://mainnet.base.org`
+   - Chain ID: `8453`
    - Currency symbol: `ETH`
-   - Block explorer: `https://sepolia.basescan.org`
+   - Block explorer: `https://basescan.org`
 
-   Save, then switch to Base Sepolia.
+   Save, then switch to Base.
 2. **Import your wallet.** Open the account menu, choose **Add account → Import account** and
    paste your `VORQ_WALLET_KEY`.
 3. **Add the USDC token.** Open **Tokens → Import tokens → Custom token** and enter
-   `0x036CbD53842c5426634e7929541eC2318f3dCF7e`. The symbol (`USDC`) and decimals (`6`) fill in
+   `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`. The symbol (`USDC`) and decimals (`6`) fill in
    by themselves. Select **Next**, then **Import**.
 4. **Sign in.** Open [vorq.co/app](https://vorq.co/app), select **Connect wallet** and sign the
    message. It moves no funds and costs no gas. Your job is under **Jobs**; opening a result asks
