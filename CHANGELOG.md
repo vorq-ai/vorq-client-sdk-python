@@ -10,6 +10,14 @@ and a plain `pip install -U vorq` always gets the newest. A breaking change bump
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-11-18
+
+### Changed
+
+- The network runs on Base mainnet. The docs describe funding a wallet with USDC on Base, and
+  the examples use `moonshotai/kimi-k3.1-pro:mxfp4`. Model ids carry a precision suffix.
+  No code change.
+
 ## [0.2.0] — 2026-10-19
 
 The first stable release.
