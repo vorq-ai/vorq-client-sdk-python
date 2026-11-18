@@ -12,9 +12,9 @@ The simplest order names one ceiling and no provider:
 
 ```python
 handle = await client.submit(
-    model="stepfun-ai/step-5-preview",
+    model="moonshotai/kimi-k3.1-pro:mxfp4",
     input="Summarize the plot of Hamlet in three bullet points.",
-    max_rate_in="0.2",      # never more than $0.20 per 1M input tokens
+    max_rate_in="1.5",      # never more than $1.50 per 1M input tokens
 )
 ```
 
