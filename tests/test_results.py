@@ -148,7 +148,7 @@ class TestTextResult:
         assert r.text == "The capital of France is Paris."
         assert r.usage == {"input_tokens": 18, "output_tokens": 8, "total_tokens": 26}
         # (18*0.22 + 8*0.75)/1e6 = (3.96 + 6.0)/1e6 = 0.00000996
-        assert r.cost == "0.00000996"
+        assert r.cost == "0.00001"
 
 
 class TestMediaResult:
@@ -161,9 +161,9 @@ class TestMediaResult:
         assert r.raw == image_job()["output"]
 
     def test_media_cost_is_output_pixels_times_rate_out(self):
-        # 1 image of 1024×768 = 786_432 px × 0.02 / 1e6 = 0.01572864
+        # 1 image of 1024×768 = 786_432 px × 0.02 / 1e6 = 0.015729
         r = settled(image_job())
-        assert r.cost == "0.01572864"
+        assert r.cost == "0.015729"
         assert r.rates == (None, Decimal("0.02"))
 
     def test_a_result_is_costed_on_what_settled_not_on_its_frames(self):
@@ -196,8 +196,8 @@ class TestMediaResult:
         assert isinstance(r, MediaResult)
         assert r.frames == [job["output"]["video"]]
         assert r.bytes() == [b"MP4DATA"]
-        # 1024×1024 × 5s = 5_242_880 pixel-seconds × 0.02 / 1e6 = 0.1048576
-        assert r.cost == "0.1048576"
+        # 1024×1024 × 5s = 5_242_880 pixel-seconds × 0.02 / 1e6 = 0.104858
+        assert r.cost == "0.104858"
 
     def test_an_unreported_seed_is_absent_not_null(self):
         job = image_job()
@@ -340,8 +340,8 @@ def test_media_cost_still_bills_pixels():
         output, {"id": "job_1", "vorq": {"rate_out": "0.09", "gas_fee": "0.03", "fee": "0.001415",
                                     **counts(0, 1_572_864)}}
     )
-    # 2 × 1024 × 768 = 1_572_864 output pixels × 0.09 / 1e6 = 0.14155776
-    assert result.cost == "0.14155776"
+    # 2 × 1024 × 768 = 1_572_864 output pixels × 0.09 / 1e6 = 0.141558
+    assert result.cost == "0.141558"
 
 
 def test_video_result_reads_duration():
@@ -425,7 +425,7 @@ class TestResultFromRaw:
         assert r.provider == 42
         assert r.job_id == "job_cid"
         # (10*0.05 + 20*0.15)/1e6 = 3.5/1e6
-        assert r.cost == "0.0000035"
+        assert r.cost == "0.000004"
 
     def test_media_output_still_dispatches_to_mediaresult(self):
         raw = json.dumps(
@@ -443,8 +443,8 @@ class TestResultFromRaw:
         r = result_from_raw(raw, job, cipher=None)
         assert isinstance(r, MediaResult)
         assert r.bytes() == [IMAGE_FRAME]
-        # 1024×768 = 786_432 px × 0.02 / 1e6 = 0.01572864
-        assert r.cost == "0.01572864"
+        # 1024×768 = 786_432 px × 0.02 / 1e6 = 0.015729
+        assert r.cost == "0.015729"
 
 
 class TestOpaqueBytes:
@@ -591,19 +591,20 @@ def test_media_cost_uses_the_same_rate_scale_as_the_chain():
     # What the chain actually charges: ceilDiv(rateOut*unitsOut, RATE_SCALE), rateOut = 2.
     charged = max(1, -(-(2 * px) // RATE_SCALE))
     assert charged == 2
-    # The display is the unrounded USD form of that same product.
-    assert result.cost == "0.000001572864"
-    assert Decimal(result.cost) * 10**6 == Decimal(2 * px) / RATE_SCALE
+    # The display is exactly that charge, in USD.
+    assert result.cost == "0.000002"
+    assert Decimal(result.cost) * 10**6 == charged
 
 
 def test_cost_is_exact_past_the_default_decimal_precision():
-    """30 significant digits of product: the default 28-digit context would round it."""
+    """30 significant digits of product: the default 28-digit context would round it before the
+    chain's round-up to the atomic unit, which is the only rounding the cost carries."""
     output = {"images": [{"b64": "", "content_type": "image/png", "width": 1, "height": 1}]}
     result = _result_from_output(
         output, {"id": "j", "vorq": {"rate_out": "123456789012345678901234.567891",
                                      "gas_fee": "0.03", "fee": "1234567890123456.789012", **counts(0, 1)}}
     )
-    assert result.cost == "123456789012345678.901234567891"
+    assert result.cost == "123456789012345678.901235"
 
 
 @pytest.mark.parametrize("rate", ["0.050", "1e3", "-1", " 1", 50000, 0.5, True])
@@ -707,7 +708,8 @@ class TestSettledCharge:
         job = text_job()
         job["vorq"].update(units_in=5000, prompt_tok=1089)
         r = settled(job)
-        assert r.cost == format((Decimal(1089) * Decimal("0.05") + 500 * Decimal("0.15")) / 10**6, "f")
+        # 1089*0.05 + 500*0.15 = 129.45 -> the chain pays 130 atomic units
+        assert r.cost == "0.00013"
 
     def test_an_absent_cached_rate_is_none_and_bills_nothing(self):
         r = settled(text_job())
@@ -718,7 +720,7 @@ class TestSettledCharge:
         job = image_job()
         job["vorq"].update(rate_in="0.01", prompt_tok=921_600)
         # (921_600*0.01 + 786_432*0.02)/1e6
-        assert settled(job).cost == "0.02494464"
+        assert settled(job).cost == "0.024945"
 
     def test_a_batch_line_carries_its_settled_counts(self):
         from vorq._results import result_from_batch_line
@@ -728,7 +730,7 @@ class TestSettledCharge:
         r = result_from_batch_line(row, raw=raw)
         assert (r.prompt_tok, r.cached_tok, r.completion_tok) == (10, 4, 20)
         # (6*0.05 + 4*0.01 + 20*0.15)/1e6
-        assert r.cost == "0.00000334"
+        assert r.cost == "0.000004"
 
 
 @pytest.mark.parametrize("field", ["prompt_tok", "cached_tok", "completion_tok"])

@@ -12,7 +12,7 @@ or `video` a `MediaResult`, and anything else a `TextResult`.
 | Attribute | Type | Meaning |
 | --- | --- | --- |
 | `.rates` | `tuple[Decimal \| None, Decimal \| None]` | The order's signed `(rate_in, rate_out)`, in USD per 1M units. |
-| `.cost` | `str` | USD decimal string: `((prompt_tok − cached_tok) × rate_in + cached_tok × rate_in_cached + completion_tok × rate_out) / 1,000,000`, exact. Excludes the protocol and gas fees. See [Units and cost](../concepts/units-and-cost.md#cost). |
+| `.cost` | `str` | USD decimal string: `((prompt_tok − cached_tok) × rate_in + cached_tok × rate_in_cached + completion_tok × rate_out) / 1,000,000`, rounded up to the atomic unit (0.000001 USD, minimum one) exactly as the chain charges it. Excludes the protocol and gas fees. See [Units and cost](../concepts/units-and-cost.md#cost). |
 | `.prompt_tok` | `int` | Prompt units the job settled on, cached ones included: the model's own count, at most `units_in`. For media, the declared reference units. From the job row. |
 | `.cached_tok` | `int` | The part of `.prompt_tok` the model served from its cache. From the job row. |
 | `.completion_tok` | `int` | Output units the job settled on, at most `units_out`. From the job row. |

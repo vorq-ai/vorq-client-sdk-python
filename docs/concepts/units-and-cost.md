@@ -53,8 +53,9 @@ tokens and spend the same `units_out` your output cap declares. Bound them with
 
 The worst case is known at submit time. See [What you pay](./bids-and-matching.md#what-you-pay).
 
-After settlement, each result carries `.cost`: a USD decimal string, computed exactly by the
-client from the counts and rates the job settled on, as the job row reports them. It excludes the
+After settlement, each result carries `.cost`: a USD decimal string, computed by the client
+from the counts and rates the job settled on, as the job row reports them, and rounded up to the
+atomic unit (0.000001 USD, minimum one) exactly as the chain charges it. It excludes the
 protocol and gas fees.
 `.gas_fee` is the flat gas fee the job was posted under, as a `Decimal` in USD. A claimed job
 pays it whether it settles, fails or is reclaimed; a job cancelled or expired before any

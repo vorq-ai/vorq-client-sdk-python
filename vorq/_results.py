@@ -13,7 +13,7 @@ import base64
 import binascii
 import json
 from dataclasses import dataclass, field
-from decimal import Context, Decimal, Inexact, InvalidOperation, Rounded, localcontext
+from decimal import ROUND_CEILING, Context, Decimal, Inexact, InvalidOperation, Rounded, localcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Union
 
@@ -93,7 +93,7 @@ def _settled(vorq: dict) -> Settled:
 
 
 def _cost(settled: Settled, rates: Rates) -> str:
-    """The chain's charge, exactly: uncached prompt at ``rate_in``, cached prompt at
+    """The chain's charge, to the atomic unit it pays: uncached prompt at ``rate_in``, cached prompt at
     ``rate_in_cached``, completion at ``rate_out``, over :data:`RATE_SCALE`.
 
     One formula for every modality — ``JobRegistry`` has one code path — so a media job is
@@ -104,7 +104,9 @@ def _cost(settled: Settled, rates: Rates) -> str:
         total = (Decimal(settled.prompt_tok - settled.cached_tok) * (rate_in or 0)
                  + Decimal(settled.cached_tok) * (settled.rate_in_cached or 0)
                  + Decimal(settled.completion_tok) * (rate_out or 0))
-    return _usd(total)
+    # The chain pays whole atomic units: max(1, ceil(Σ units × rate)) at six decimals.
+    atomic = max(1, int(total.to_integral_value(rounding=ROUND_CEILING)))
+    return _usd(Decimal(atomic))
 
 
 def _flatten_response_output(output_items: list[dict]) -> str:
