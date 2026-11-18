@@ -335,7 +335,7 @@ def node_job(**over) -> dict:
         "units_in": 12, "units_out": 4096,
         "designated": 0, "provider_id": 7,
         "expires_at": 1800000000, "task_cid": "bafy-task",
-        "completion_tok": 0, "state": 2, "ended_because": 1,
+        "prompt_tok": 12, "cached_tok": 0, "completion_tok": 0, "state": 2, "ended_because": 1,
     }
     vorq.update(over.pop("vorq", {}))
     job = {
@@ -368,7 +368,8 @@ COMPLETED_TEXT_JOB = {
     "result_cid": fake_cid(COMPLETED_TEXT_BYTES),
     "output": json_.loads(COMPLETED_TEXT_BYTES),
     "vorq": {"gas_fee": "0.03", "fee": "0.000001", "sla_secs": 3600, "rate_in": "0.05", "rate_out": "0.15",
-             "provider_id": 7, "state": 2, "ended_because": 1},
+             "provider_id": 7, "state": 2, "ended_because": 1,
+             "prompt_tok": 1000, "cached_tok": 0, "completion_tok": 500},
 }
 
 
@@ -444,6 +445,22 @@ class TestSubmit:
         assert _open_complete(captured["complete"])["custom_id"] == "req-42"
         # and nothing about it is on the cleartext terms
         assert "custom_id" not in json_keys(captured["complete"])
+        await client.aclose()
+
+    async def test_a_custom_id_outside_1_to_64_characters_is_refused(self):
+        """Same cap as a batch line: the provider bounds the sealed envelope frame by it
+        when it checks units_in against the payload size."""
+        def jobs(request):
+            body = req_body(request)
+            if "auth_sig" not in body:
+                return json_response(402, quote_body(body))
+            return json_response(200, queued_job(sla="24h"))
+
+        client = Client(transport=httpx.MockTransport(auth_router(jobs)))
+        for bad in ("x" * 65, ""):
+            with pytest.raises(ValidationError, match="custom_id"):
+                await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hello",
+                                    sla="batch", provider=1, custom_id=bad)
         await client.aclose()
 
     async def test_an_unlabelled_submission_carries_no_custom_id_key(self):
@@ -1833,7 +1850,7 @@ class TestEncryptedSubmit:
         completed = {
             "id": "0xabc", "object": "job", "model": "deepseek-ai/deepseek-v4-pro:fp8", "status": "completed",
             "result_cid": fake_cid(raw),
-            "vorq": {"gas_fee": "0.03", "fee": "0",
+            "vorq": {"gas_fee": "0.03", "fee": "0", "prompt_tok": 10, "cached_tok": 0, "completion_tok": 20,
                      "sla_secs": 3600, "rate_in": "0.05", "rate_out": "0.15", "provider_id": 7},
         }
 
@@ -1999,7 +2016,7 @@ class TestJobHandle:
         job = {
             "id": "0xabc", "object": "job", "model": "deepseek-ai/deepseek-v4-pro:fp8",
             "status": "completed", "result_cid": cid,
-            "vorq": {"gas_fee": "0.03", "fee": "0",
+            "vorq": {"gas_fee": "0.03", "fee": "0", "prompt_tok": 10, "cached_tok": 0, "completion_tok": 20,
                      "sla_secs": 3600, "rate_in": "0.05", "rate_out": "0.15", "provider_id": 7},
         }
         seen = {}

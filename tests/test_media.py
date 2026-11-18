@@ -34,6 +34,14 @@ def test_the_shared_cases_derive_the_units_they_pin(case):
     assert (units_in, units_out) == (case["units_in"], case["units_out"]), case["why"]
 
 
+def test_text_units_in_is_the_canonical_byte_length():
+    """A ceiling, not a count: settle bills the backend's own prompt count under it."""
+    assert _declare_units({"input": "hello"}) == (17, 4096)    # {"input":"hello"}
+    assert _declare_units({}) == (2, 4096)                     # {} is never zero
+    # Bytes, not characters: "é" is two bytes of UTF-8, "😀" four (ensure_ascii=False).
+    assert _declare_units({"input": "é😀"})[0] == len('{"input":"é😀"}'.encode())
+
+
 def test_the_case_list_has_not_quietly_shrunk():
     """Losing a case is silent — the parametrize above just runs fewer tests. The
     shapes named here are the ones this round exists to price correctly."""

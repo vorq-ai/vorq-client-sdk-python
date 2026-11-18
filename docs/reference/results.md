@@ -12,7 +12,11 @@ or `video` a `MediaResult`, and anything else a `TextResult`.
 | Attribute | Type | Meaning |
 | --- | --- | --- |
 | `.rates` | `tuple[Decimal \| None, Decimal \| None]` | The order's signed `(rate_in, rate_out)`, in USD per 1M units. |
-| `.cost` | `str` | USD decimal string, computed exactly from the signed rates and the result's counts. Excludes the protocol and gas fees. See [Units and cost](../concepts/units-and-cost.md#cost). |
+| `.cost` | `str` | USD decimal string: `((prompt_tok − cached_tok) × rate_in + cached_tok × rate_in_cached + completion_tok × rate_out) / 1,000,000`, exact. Excludes the protocol and gas fees. See [Units and cost](../concepts/units-and-cost.md#cost). |
+| `.prompt_tok` | `int` | Prompt units the job settled on, cached ones included: the model's own count, at most `units_in`. For media, the declared reference units. From the job row. |
+| `.cached_tok` | `int` | The part of `.prompt_tok` the model served from its cache. From the job row. |
+| `.completion_tok` | `int` | Output units the job settled on, at most `units_out`. From the job row. |
+| `.rate_in_cached` | `Decimal \| None` | USD per 1M cached prompt units, as settled. `None` when the row carries none. |
 | `.gas_fee` | `Decimal` | The flat gas fee the job was posted under, in USD, paid on top of `.cost`. |
 | `.fee` | `Decimal` | The protocol fee settlement took, in USD, paid on top of `.cost`. |
 | `.provider` | `int \| str \| None` | Registry id of the provider that settled the job. |
@@ -26,7 +30,7 @@ or `video` a `MediaResult`, and anything else a `TextResult`.
 | --- | --- | --- |
 | `.text` | `str` | The generated text, joined from the output items. |
 | `.output` | `list` | The raw output items: Responses output items, or `choices` for a chat-completion result. |
-| `.usage` | `dict` | `input_tokens`, `output_tokens` and `total_tokens`. |
+| `.usage` | `dict` | `input_tokens`, `output_tokens` and `total_tokens`, as the model reported them. `.cost` reads the settled counts, not this. |
 
 ## `MediaResult`
 
@@ -45,7 +49,7 @@ The frames travel inside the sealed result as base64, so these methods make no n
 | --- | --- | --- |
 | `.embeddings` | `list[dict]` | The response's `data` array, unchanged. |
 | `.model` | `str \| None` | The model named in the response. |
-| `.prompt_tokens` | `int` | Input tokens. |
+| `.prompt_tokens` | `int` | Input tokens, as the response reported them. |
 | `.bytes()` | `list[bytes]` | The vectors decoded from base64. Raises `VorqError` when the response used `encoding_format="float"`; read `.embeddings` instead. |
 
 ## `JobError`

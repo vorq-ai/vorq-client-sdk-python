@@ -10,6 +10,21 @@ and a plain `pip install -U vorq` always gets the newest. A breaking change bump
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** text and embedding `units_in` is the byte length of the canonical JSON input
+  (was one unit per four bytes). It is a ceiling: settlement bills the model's own prompt count
+  under it and refunds the rest.
+- **Breaking:** `.cost` is the chain's charge off the job row's settled counts,
+  `((prompt_tok − cached_tok) × rate_in + cached_tok × rate_in_cached + completion_tok × rate_out) / 1,000,000`,
+  for every result type. A job row or batch line without `prompt_tok`, `cached_tok` and
+  `completion_tok` is refused.
+
+### Added
+
+- `prompt_tok`, `cached_tok`, `completion_tok` and `rate_in_cached` on `TextResult`, `MediaResult`
+  and `EmbeddingResult`.
+
 ## [0.2.1] — 2026-11-18
 
 ### Changed

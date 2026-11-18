@@ -125,7 +125,8 @@ def _emulator_handler(state: dict, *, opaque: bool = False, media: bool = False)
             job = {
                 "id": state["job_id"], "object": "job", "status": "completed",
                 "vorq": {"gas_fee": "0.03", "fee": "0", "sla_secs": 3600, "rate_in": "0.1",
-                         "rate_out": "0.5", "provider_id": 3, "state": 2, "ended_because": 1},
+                         "rate_out": "0.5", "provider_id": 3, "state": 2, "ended_because": 1,
+                         "prompt_tok": 3, "cached_tok": 0, "completion_tok": 7},
             }
             named = b"\x00\x01\xff\xfe" if opaque else json.dumps(output).encode()
             state["result_bytes"] = named
@@ -367,7 +368,8 @@ def test_media_result_renders_as_image_generation_calls():
     result = MediaResult(frames=[{"b64": b64, "content_type": "image/png",
                                   "width": 1024, "height": 768}],
                          seed=42, raw={}, rates=(None, Decimal("0.09")), cost="0.07077888", gas_fee=Decimal("0.03"),
-                         fee=Decimal("0.000707"), provider=1, job_id="job_1")
+                         fee=Decimal("0.000707"), prompt_tok=0, cached_tok=0, completion_tok=786_432,
+                         rate_in_cached=None, provider=1, job_id="job_1")
 
     obj = _response_object({"id": "job_1", "status": "completed"},
                            model="m", background=False, result=result)

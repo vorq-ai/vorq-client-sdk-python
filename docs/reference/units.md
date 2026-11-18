@@ -20,11 +20,15 @@ below raise `ValidationError` before anything is sealed.
 
 | Shape | `units_in` | `units_out` |
 | --- | --- | --- |
-| text | `max(1, len(canonical JSON of the input) // 4)` | the first ceiling present, in the order above, or `4096` |
+| text | `len(canonical JSON of the input in UTF-8)` | the first ceiling present, in the order above, or `4096` |
 | image | [reference pixel-seconds](#reference-assets), or `0` | frame pixels × `num_images` (default 1) |
 | video | reference pixel-seconds, or `0` | frame pixels × duration seconds |
 
 `submit(..., units_out=N)` replaces the output count; it doesn't change `units_in`.
+
+For text, `units_in` is the request's byte length: a ceiling that sits above the model's own
+prompt count for anything but a few-word prompt. Settlement bills the model's count and refunds
+the unused part.
 
 ## Frame pixels
 

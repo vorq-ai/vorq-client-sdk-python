@@ -170,7 +170,7 @@ def output_row(n: int, job_id: str, cid: str) -> str:
         "error": None,
         "vorq": {"job_id": job_id, "result_cid": cid, "provider": 7,
                  "rate_in": "0.03", "rate_out": "0.09", "gas_fee": "0.03", "fee": "0",
-                 "completion_tok": 20},
+                 "prompt_tok": 10, "cached_tok": 0, "completion_tok": 20},
     })
 
 

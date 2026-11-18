@@ -106,6 +106,8 @@ amount = cap + protocol fee + gas fee
 
 `cap` is the most the job can charge for the work itself, fixed by the terms you signed. The
 protocol fee is a share of the cap, and the gas fee covers the coordinator relaying your order.
+Settlement charges the counts the job actually used (see [Cost](./units-and-cost.md#cost)) and
+refunds the rest of the cap with its share of the protocol fee.
 The quote states every amount as a USD decimal string.
 
 The client derives every member of the payment authorization itself; the quote supplies only

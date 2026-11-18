@@ -17,6 +17,11 @@ from vorq._results import (
 from vorq.errors import ResultIntegrityError, VorqError
 
 
+def counts(prompt=0, completion=0, cached=0):
+    """The settled counts a job row carries once the chain has charged it."""
+    return {"prompt_tok": prompt, "cached_tok": cached, "completion_tok": completion}
+
+
 def settled(job):
     """Read a job's result the only way a settled job is ever read: from the
     bytes it named. The fixtures carry the body as ``output`` for readability;
@@ -45,7 +50,7 @@ def text_job(status="completed"):
             ],
             "usage": {"input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500},
         },
-        "vorq": {"gas_fee": "0.03", "fee": "0.000001",
+        "vorq": {"gas_fee": "0.03", "fee": "0.000001", **counts(1000, 500),
                  "sla_secs": 3600, "rate_in": "0.05", "rate_out": "0.15", "provider_id": 42},
     }
 
@@ -71,7 +76,7 @@ def chat_completion_job(status="completed"):
             ],
             "usage": {"prompt_tokens": 18, "completion_tokens": 8, "total_tokens": 26},
         },
-        "vorq": {"gas_fee": "0.03", "fee": "0",
+        "vorq": {"gas_fee": "0.03", "fee": "0", **counts(18, 8),
                  "sla_secs": 3600, "rate_in": "0.22", "rate_out": "0.75", "provider_id": 42},
     }
 
@@ -99,7 +104,8 @@ def image_job():
         "metrics": {"inference_time": 12.4},
         # The emulator OMITS rate_in for models that meter no input side
         # (guide.md §2), rather than sending it as null. Parser uses .get().
-        "vorq": {"gas_fee": "0.03", "fee": "0.000157", "sla_secs": 86400, "rate_out": "0.02", "provider_id": 42},
+        "vorq": {"gas_fee": "0.03", "fee": "0.000157", **counts(0, 786_432),
+                 "sla_secs": 86400, "rate_out": "0.02", "provider_id": 42},
     }
 
 
@@ -160,15 +166,16 @@ class TestMediaResult:
         assert r.cost == "0.01572864"
         assert r.rates == (None, Decimal("0.02"))
 
-    def test_a_result_that_states_its_settled_units_is_costed_on_them(self):
+    def test_a_result_is_costed_on_what_settled_not_on_its_frames(self):
         """Frames are labelled with what was delivered, and the order's `units_out`
         caps what is charged. When a render comes back larger than its cap the two
-        differ, and the charge is the smaller — which only the provider's stamp says.
+        differ, and the charge is the job row's settled count — what the chain took.
         """
         job = image_job()
-        job["output"]["units"] = 500_000          # capped under the frame's 786_432 px
+        job["vorq"]["completion_tok"] = 500_000   # capped under the frame's 786_432 px
         r = settled(job)
         assert r.cost == "0.01"
+        assert r.completion_tok == 500_000
 
     def test_video_frames_and_cost_from_pixel_seconds(self):
         job = {
@@ -182,7 +189,7 @@ class TestMediaResult:
                           "width": 1024, "height": 1024, "duration_secs": 5},
                 "seed": 7,
             },
-            "vorq": {"gas_fee": "0.03", "fee": "0.001048",
+            "vorq": {"gas_fee": "0.03", "fee": "0.001048", **counts(0, 5_242_880),
                      "sla_secs": 86400, "rate_in": None, "rate_out": "0.02", "provider_id": 7},
         }
         r = settled(job)
@@ -214,7 +221,8 @@ class TestCorrelationStamp:
     def test_custom_id_from_the_stamp_lands_on_the_result(self):
         output = self._stamped({"job_id": "job_1", "custom_id": "req-42"})
         r = _result_from_output(
-            output, {"id": "job_1", "vorq": {"rate_in": "0", "rate_out": "0", "gas_fee": "0.03", "fee": "0"}}
+            output, {"id": "job_1", "vorq": {"rate_in": "0", "rate_out": "0", "gas_fee": "0.03", "fee": "0",
+                                    **counts()}}
         )
         assert r.custom_id == "req-42"
 
@@ -222,7 +230,7 @@ class TestCorrelationStamp:
         """`raw` is what the model returned. The stamp is VORQ's, added outside it, and a
         caller reading `raw` must see exactly the OpenAI shape it would have got directly."""
         output = self._stamped({"job_id": "job_1", "custom_id": "req-42"})
-        r = _result_from_output(output, {"id": "job_1", "vorq": {"gas_fee": "0.03", "fee": "0"}})
+        r = _result_from_output(output, {"id": "job_1", "vorq": {"gas_fee": "0.03", "fee": "0", **counts()}})
         assert "vorq" not in r.raw
         assert r.raw["object"] == "response"
 
@@ -231,7 +239,7 @@ class TestCorrelationStamp:
         that does not stamp, is an ordinary result with no label."""
         output = self._stamped({})
         del output["vorq"]
-        r = _result_from_output(output, {"id": "job_1", "vorq": {"gas_fee": "0.03", "fee": "0"}})
+        r = _result_from_output(output, {"id": "job_1", "vorq": {"gas_fee": "0.03", "fee": "0", **counts()}})
         assert r.custom_id is None
 
     def test_a_stamp_naming_another_job_is_never_an_error(self):
@@ -239,7 +247,7 @@ class TestCorrelationStamp:
         them away over a label would turn a provider-side bookkeeping bug into a lost answer.
         The result reads normally and `job_id` stays the job the client asked about."""
         output = self._stamped({"job_id": "some-other-job", "custom_id": "req-9"})
-        r = _result_from_output(output, {"id": "job_1", "vorq": {"gas_fee": "0.03", "fee": "0"}})
+        r = _result_from_output(output, {"id": "job_1", "vorq": {"gas_fee": "0.03", "fee": "0", **counts()}})
         assert r.custom_id == "req-9"
         assert r.job_id == "job_1"
         assert r.text == "hi"
@@ -259,7 +267,8 @@ def test_an_embedding_response_dispatches_to_an_embedding_result():
         "usage": {"prompt_tokens": 12, "total_tokens": 12},
     }
     result = _result_from_output(
-        output, {"id": "job_1", "vorq": {"rate_in": "0.02", "rate_out": "0", "gas_fee": "0.03", "fee": "0"}}
+        output, {"id": "job_1", "vorq": {"rate_in": "0.02", "rate_out": "0", "gas_fee": "0.03", "fee": "0",
+                                    **counts(12)}}
     )
 
     assert isinstance(result, EmbeddingResult)
@@ -271,8 +280,7 @@ def test_an_embedding_response_dispatches_to_an_embedding_result():
 
 def test_an_embedding_result_costs_only_its_input_side():
     """There is no output leg to bill: the backend reports no completion count and the job
-    settles at `completionTok == 0`. A cost that read `rate_out` would invent a charge the
-    chain never made."""
+    settles at `completionTok == 0`, so `rate_out` is multiplied by zero and invents nothing."""
     output = {
         "object": "list",
         "data": [{"object": "embedding", "index": 0, "embedding": "dmVj"}],
@@ -282,7 +290,8 @@ def test_an_embedding_result_costs_only_its_input_side():
     # A nonzero rate_out is deliberately present — an input-only ask may still carry one, and
     # it must not reach the bill.
     result = _result_from_output(
-        output, {"id": "j", "vorq": {"rate_in": "0.02", "rate_out": "9.99", "gas_fee": "0.03", "fee": "0.0002"}}
+        output, {"id": "j", "vorq": {"rate_in": "0.02", "rate_out": "9.99", "gas_fee": "0.03", "fee": "0.0002",
+                                **counts(1_000_000)}}
     )
 
     assert result.cost == "0.02"
@@ -295,7 +304,7 @@ def test_an_embedding_result_decodes_its_vectors():
         "model": "m",
         "usage": {"prompt_tokens": 1, "total_tokens": 1},
     }
-    result = _result_from_output(output, {"id": "j", "vorq": {"rate_in": "0.02", "gas_fee": "0.03", "fee": "0"}})
+    result = _result_from_output(output, {"id": "j", "vorq": {"rate_in": "0.02", "gas_fee": "0.03", "fee": "0", **counts(1)}})
 
     assert result.bytes() == [b"\x01\x02\x03"]
 
@@ -309,7 +318,8 @@ def test_media_result_decodes_frames_without_a_network_call(tmp_path):
         "seed": 42,
     }
     result = _result_from_output(
-        output, {"id": "job_1", "vorq": {"rate_out": "0.09", "gas_fee": "0.03", "fee": "0.000707"}}
+        output, {"id": "job_1", "vorq": {"rate_out": "0.09", "gas_fee": "0.03", "fee": "0.000707",
+                                    **counts(0, 786_432)}}
     )
 
     assert isinstance(result, MediaResult)
@@ -327,7 +337,8 @@ def test_media_cost_still_bills_pixels():
     output = {"images": [{"b64": "", "content_type": "image/png", "width": 1024, "height": 768},
                          {"b64": "", "content_type": "image/png", "width": 1024, "height": 768}]}
     result = _result_from_output(
-        output, {"id": "job_1", "vorq": {"rate_out": "0.09", "gas_fee": "0.03", "fee": "0.001415"}}
+        output, {"id": "job_1", "vorq": {"rate_out": "0.09", "gas_fee": "0.03", "fee": "0.001415",
+                                    **counts(0, 1_572_864)}}
     )
     # 2 × 1024 × 768 = 1_572_864 output pixels × 0.09 / 1e6 = 0.14155776
     assert result.cost == "0.14155776"
@@ -337,7 +348,7 @@ def test_video_result_reads_duration():
     output = {"video": {"b64": base64.b64encode(b"mp4").decode(),
                         "content_type": "video/mp4", "duration_secs": 5}}
     result = _result_from_output(
-        output, {"id": "job_1", "vorq": {"rate_out": "0.09", "gas_fee": "0.03", "fee": "0"}}
+        output, {"id": "job_1", "vorq": {"rate_out": "0.09", "gas_fee": "0.03", "fee": "0", **counts()}}
     )
     assert result.bytes() == [b"mp4"]
     assert result.frames[0]["duration_secs"] == 5
@@ -404,7 +415,7 @@ class TestResultFromRaw:
             "object": "job",
             "status": "completed",
             "result_cid": fake_cid(raw),
-            "vorq": {"gas_fee": "0.03", "fee": "0",
+            "vorq": {"gas_fee": "0.03", "fee": "0", **counts(10, 20),
                      "sla_secs": 3600, "rate_in": "0.05", "rate_out": "0.15", "provider_id": 42},
         }
         r = result_from_raw(raw, job, cipher=cipher)
@@ -426,7 +437,7 @@ class TestResultFromRaw:
             "id": "job_img",
             "status": "completed",
             "result_cid": fake_cid(raw),
-            "vorq": {"gas_fee": "0.03", "fee": "0.000157",
+            "vorq": {"gas_fee": "0.03", "fee": "0.000157", **counts(0, 786_432),
                      "sla_secs": 86400, "rate_out": "0.02", "provider_id": 42},
         }
         r = result_from_raw(raw, job, cipher=None)
@@ -527,7 +538,7 @@ class TestFramesThatAreNotFrames:
             "status": "completed",
             "output": {"video": {"b64": "not base64 at all!", "content_type": "video/mp4",
                                  "width": 1024, "height": 1024, "duration_secs": 5}},
-            "vorq": {"gas_fee": "0.03", "fee": "0.001048",
+            "vorq": {"gas_fee": "0.03", "fee": "0.001048", **counts(0, 5_242_880),
                      "sla_secs": 86400, "rate_out": "0.02", "provider_id": 7},
         }
         with pytest.raises(ResultIntegrityError):
@@ -574,7 +585,8 @@ def test_media_cost_uses_the_same_rate_scale_as_the_chain():
     output = {"images": [{"b64": "", "content_type": "image/png",
                           "width": 1024, "height": 768}]}
     result = _result_from_output(
-        output, {"id": "job_px", "vorq": {"rate_in": None, "rate_out": "0.000002", "gas_fee": "0.03", "fee": "0"}}
+        output, {"id": "job_px", "vorq": {"rate_in": None, "rate_out": "0.000002", "gas_fee": "0.03", "fee": "0",
+                                     **counts(0, px)}}
     )
     # What the chain actually charges: ceilDiv(rateOut*unitsOut, RATE_SCALE), rateOut = 2.
     charged = max(1, -(-(2 * px) // RATE_SCALE))
@@ -589,7 +601,7 @@ def test_cost_is_exact_past_the_default_decimal_precision():
     output = {"images": [{"b64": "", "content_type": "image/png", "width": 1, "height": 1}]}
     result = _result_from_output(
         output, {"id": "j", "vorq": {"rate_out": "123456789012345678901234.567891",
-                                     "gas_fee": "0.03", "fee": "1234567890123456.789012"}}
+                                     "gas_fee": "0.03", "fee": "1234567890123456.789012", **counts(0, 1)}}
     )
     assert result.cost == "123456789012345678.901234567891"
 
@@ -631,7 +643,8 @@ def test_a_job_row_whose_fee_is_missing_or_not_a_canonical_usd_string_is_refused
 
 def _batch_success_row(raw: bytes, **over) -> dict:
     vorq = {"job_id": "0xabc", "result_cid": fake_cid(raw), "provider": 7,
-            "rate_in": "0.05", "rate_out": "0.15", "gas_fee": "0.03", "fee": "0", **over}
+            "rate_in": "0.05", "rate_out": "0.15", "gas_fee": "0.03", "fee": "0",
+            **counts(10, 20), **over}
     return {"id": "batch_req_1_1", "response": {"body": None}, "vorq": vorq}
 
 
@@ -674,3 +687,73 @@ def test_a_batch_success_row_whose_fee_is_missing_or_not_canonical_is_refused(fe
         result_from_batch_line(row, raw=raw)
     assert excinfo.value.type == "api_error"
     assert "vorq.fee" in str(excinfo.value)
+
+
+class TestSettledCharge:
+    """The cost is the chain's charge, off the job row's settled counts:
+    `(prompt_tok − cached_tok) × rate_in + cached_tok × rate_in_cached + completion_tok × rate_out`."""
+
+    def test_cached_prompt_units_are_billed_at_the_cached_rate(self):
+        job = text_job()
+        job["vorq"].update(counts(1000, 500, cached=400), rate_in_cached="0.01")
+        r = settled(job)
+        # (600*0.05 + 400*0.01 + 500*0.15)/1e6 = (30 + 4 + 75)/1e6
+        assert r.cost == "0.000109"
+        assert (r.prompt_tok, r.cached_tok, r.completion_tok) == (1000, 400, 500)
+        assert r.rate_in_cached == Decimal("0.01")
+
+    def test_the_backends_count_bills_not_the_declared_ceiling(self):
+        """`units_in` is a ceiling; what was charged is `prompt_tok`, whatever the body says."""
+        job = text_job()
+        job["vorq"].update(units_in=5000, prompt_tok=1089)
+        r = settled(job)
+        assert r.cost == format((Decimal(1089) * Decimal("0.05") + 500 * Decimal("0.15")) / 10**6, "f")
+
+    def test_an_absent_cached_rate_is_none_and_bills_nothing(self):
+        r = settled(text_job())
+        assert r.rate_in_cached is None
+        assert r.cached_tok == 0
+
+    def test_a_media_job_bills_its_reference_units_at_rate_in(self):
+        job = image_job()
+        job["vorq"].update(rate_in="0.01", prompt_tok=921_600)
+        # (921_600*0.01 + 786_432*0.02)/1e6
+        assert settled(job).cost == "0.02494464"
+
+    def test_a_batch_line_carries_its_settled_counts(self):
+        from vorq._results import result_from_batch_line
+
+        raw = json.dumps(PLAINTEXT_OUTPUT).encode()
+        row = _batch_success_row(raw, cached_tok=4, rate_in_cached="0.01")
+        r = result_from_batch_line(row, raw=raw)
+        assert (r.prompt_tok, r.cached_tok, r.completion_tok) == (10, 4, 20)
+        # (6*0.05 + 4*0.01 + 20*0.15)/1e6
+        assert r.cost == "0.00000334"
+
+
+@pytest.mark.parametrize("field", ["prompt_tok", "cached_tok", "completion_tok"])
+@pytest.mark.parametrize("value", [None, -1, "10", 1.5, True])
+def test_a_job_row_whose_settled_count_is_missing_or_not_a_count_is_refused(field, value):
+    job = text_job()
+    job["vorq"][field] = value
+    if value is None:
+        del job["vorq"][field]
+    with pytest.raises(VorqError) as excinfo:
+        settled(job)
+    assert excinfo.value.type == "api_error"
+    assert field in str(excinfo.value)
+
+
+def test_a_cached_count_above_the_prompt_count_is_refused():
+    job = text_job()
+    job["vorq"]["cached_tok"] = 1001
+    with pytest.raises(VorqError, match="cached_tok"):
+        settled(job)
+
+
+@pytest.mark.parametrize("rate", ["0.010", "1e3", 10, 0.01])
+def test_a_cached_rate_that_is_not_a_canonical_usd_string_is_refused(rate):
+    job = text_job()
+    job["vorq"]["rate_in_cached"] = rate
+    with pytest.raises(VorqError, match="rate_in_cached"):
+        settled(job)

@@ -1,8 +1,10 @@
 """Result types delivered on every path.
 
 ``handle.result()`` normalizes to :class:`TextResult` / :class:`MediaResult`
-values. The API states terms and counts, never totals — ``.cost`` is computed here from the signed rates and the
-job's unit counts, the same arithmetic that settles on-chain.
+values. The API states terms and counts, never totals — ``.cost`` is computed here from the
+job's settled counts and rates, the same arithmetic that settles on-chain:
+``(prompt_tok − cached_tok) × rate_in + cached_tok × rate_in_cached + completion_tok × rate_out``,
+over 1M.
 """
 
 from __future__ import annotations
@@ -47,45 +49,62 @@ def _usd(units_times_rate: Decimal) -> str:
     return text.rstrip("0").rstrip(".") if "." in text else text
 
 
-def _text_cost(usage: dict, rates: Rates) -> str:
+@dataclass(frozen=True)
+class Settled:
+    """What the chain settled the job on, off the job row.
+
+    The backend's own counts, signed by the provider and clamped on chain:
+    ``prompt_tok ≤ units_in``, ``cached_tok ≤ prompt_tok``, ``completion_tok ≤ units_out``,
+    ``rate_in_cached ≤ rate_in``. A media job settles ``prompt_tok = units_in``, ``cached_tok = 0``.
+    """
+
+    prompt_tok: int
+    cached_tok: int
+    completion_tok: int
+    rate_in_cached: Decimal | None
+
+
+def _count(vorq: dict, field: str) -> int:
+    value = vorq.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise VorqError(
+            f"the node sent {field}={value!r}, which is not a settled count",
+            type="api_error",
+        )
+    return value
+
+
+def _settled(vorq: dict) -> Settled:
+    """The settled counts a result is costed on: required, never defaulted."""
+    prompt_tok = _count(vorq, "prompt_tok")
+    cached_tok = _count(vorq, "cached_tok")
+    if cached_tok > prompt_tok:
+        raise VorqError(
+            f"the node sent cached_tok={cached_tok} above prompt_tok={prompt_tok}",
+            type="api_error",
+        )
+    rate = vorq.get("rate_in_cached")
+    return Settled(
+        prompt_tok=prompt_tok,
+        cached_tok=cached_tok,
+        completion_tok=_count(vorq, "completion_tok"),
+        rate_in_cached=None if rate is None else wire_usd(rate, "vorq.rate_in_cached"),
+    )
+
+
+def _cost(settled: Settled, rates: Rates) -> str:
+    """The chain's charge, exactly: uncached prompt at ``rate_in``, cached prompt at
+    ``rate_in_cached``, completion at ``rate_out``, over :data:`RATE_SCALE`.
+
+    One formula for every modality — ``JobRegistry`` has one code path — so a media job is
+    costed on its reference units and its delivered pixels alike. An absent rate is zero.
+    """
     rate_in, rate_out = rates
     with localcontext(_EXACT):
-        total = (Decimal(usage.get("input_tokens", 0)) * (rate_in or 0)
-                 + Decimal(usage.get("output_tokens", 0)) * (rate_out or 0))
+        total = (Decimal(settled.prompt_tok - settled.cached_tok) * (rate_in or 0)
+                 + Decimal(settled.cached_tok) * (settled.rate_in_cached or 0)
+                 + Decimal(settled.completion_tok) * (rate_out or 0))
     return _usd(total)
-
-
-def _media_cost(units: int | Decimal, rates: Rates) -> str:
-    """Output pixels (or pixel-seconds) against the signed rate.
-
-    Divided by :data:`RATE_SCALE` like every other modality, because
-    ``JobRegistry._atomicCharge`` has one code path and no media exception: a
-    rate is priced per ``RATE_SCALE`` units of work whatever is being metered.
-    """
-    _, rate_out = rates
-    with localcontext(_EXACT):
-        total = Decimal(units) * (rate_out or 0)
-    return _usd(total)
-
-
-def _embedding_cost(usage: dict, rates: Rates) -> str:
-    """Input side only, and `rate_out` is deliberately not read.
-
-    An embeddings backend reports `prompt_tokens` and no completion count, so the job settles
-    at `completionTok == 0` and the chain's charge is `rate_in * units_in`. An input-only ask
-    may still publish a nonzero `rate_out` — it is inert, multiplied by zero units — and
-    reading it here would display a charge nobody was ever billed.
-    """
-    rate_in, _ = rates
-    with localcontext(_EXACT):
-        total = Decimal(usage.get("prompt_tokens", 0)) * (rate_in or 0)
-    return _usd(total)
-
-
-# A produced frame's pixels (width × height), defaulting each dimension to 1024 to match
-# the coordinator/provider so the displayed cost tracks the per-pixel rate_out.
-def _frame_pixels(frame: dict) -> int:
-    return int(frame.get("width", 1024) or 1024) * int(frame.get("height", 1024) or 1024)
 
 
 def _flatten_response_output(output_items: list[dict]) -> str:
@@ -110,6 +129,12 @@ class TextResult:
     gas_fee: Decimal
     #: The protocol fee settlement took, in USD, on top of ``cost``.
     fee: Decimal
+    #: The backend's own counts the chain charged — see :class:`Settled`.
+    prompt_tok: int
+    cached_tok: int
+    completion_tok: int
+    #: USD per 1M cached prompt units, as settled; ``None`` when the row carries none.
+    rate_in_cached: Decimal | None
     provider: int | str | None
     job_id: str | None
     #: The caller's own label for this line, echoed back by the provider from inside the
@@ -126,6 +151,12 @@ class MediaResult:
     cost: str
     gas_fee: Decimal
     fee: Decimal
+    #: The backend's own counts the chain charged — see :class:`Settled`.
+    prompt_tok: int
+    cached_tok: int
+    completion_tok: int
+    #: USD per 1M cached prompt units, as settled; ``None`` when the row carries none.
+    rate_in_cached: Decimal | None
     provider: int | str | None
     job_id: str | None
     custom_id: str | None = None
@@ -199,6 +230,12 @@ class EmbeddingResult:
     cost: str
     gas_fee: Decimal
     fee: Decimal
+    #: The backend's own counts the chain charged — see :class:`Settled`.
+    prompt_tok: int
+    cached_tok: int
+    completion_tok: int
+    #: USD per 1M cached prompt units, as settled; ``None`` when the row carries none.
+    rate_in_cached: Decimal | None
     provider: int | str | None
     job_id: str | None
     custom_id: str | None = None
@@ -241,22 +278,14 @@ def _is_embedding(output: dict) -> bool:
     )
 
 
-def _embedding_result(
-    output: dict, rates: Rates, gas_fee: Decimal, fee: Decimal, provider, job_id, custom_id
-) -> EmbeddingResult:
+def _embedding_result(output: dict, terms: dict) -> EmbeddingResult:
     usage = output.get("usage") or {}
     return EmbeddingResult(
         embeddings=output.get("data") or [],
         model=output.get("model"),
         prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
         raw=output,
-        rates=rates,
-        cost=_embedding_cost(usage, rates),
-        gas_fee=gas_fee,
-        fee=fee,
-        provider=provider,
-        job_id=job_id,
-        custom_id=custom_id,
+        **terms,
     )
 
 
@@ -264,64 +293,27 @@ def _is_media(output: dict) -> bool:
     return isinstance(output, dict) and ("images" in output or "video" in output)
 
 
-def _media_result(
-    output: dict, rates: Rates, gas_fee: Decimal, fee: Decimal,
-    provider: int | str | None, job_id: str | None, custom_id: str | None,
-) -> MediaResult:
+def _media_result(output: dict, terms: dict) -> MediaResult:
     if "images" in output:
         frames = list(output.get("images", []))
-        # Output pixels, summed over the delivered images — the image billing unit.
-        units: int | Decimal = sum(_frame_pixels(f) for f in frames)
     else:
         video = output.get("video", {})
         frames = [video] if video else []
-        # Pixel-seconds — the video billing unit.
-        units = _frame_pixels(video) * int(video.get("duration_secs", 0) or 0)
-    # The provider's own statement of what settled, when it makes one: frames are
-    # labelled with what was delivered, the order's `units_out` caps the charge,
-    # and a render larger than its cap makes the two differ.
-    stated = output.get("units")
-    if isinstance(stated, int) and not isinstance(stated, bool) and 0 <= stated <= units:
-        units = stated
-    return MediaResult(
-        frames=frames,
-        seed=output.get("seed"),
-        raw=output,
-        rates=rates,
-        cost=_media_cost(units, rates),
-        gas_fee=gas_fee,
-        fee=fee,
-        provider=provider,
-        job_id=job_id,
-        custom_id=custom_id,
-    )
+    return MediaResult(frames=frames, seed=output.get("seed"), raw=output, **terms)
 
 
-def _text_result_from_response(
-    response: dict, rates: Rates, gas_fee: Decimal, fee: Decimal,
-    provider: int | str | None, job_id: str | None, custom_id: str | None,
-) -> TextResult:
+def _text_result_from_response(response: dict, terms: dict) -> TextResult:
     output_items = response.get("output", []) or []
-    usage = dict(response.get("usage", {}) or {})
     return TextResult(
         text=_flatten_response_output(output_items),
         output=output_items,
-        usage=usage,
+        usage=dict(response.get("usage", {}) or {}),
         raw=response,
-        rates=rates,
-        cost=_text_cost(usage, rates),
-        gas_fee=gas_fee,
-        fee=fee,
-        provider=provider,
-        job_id=job_id,
-        custom_id=custom_id,
+        **terms,
     )
 
 
-def _text_result_from_chat_completion(
-    body: dict, rates: Rates, gas_fee: Decimal, fee: Decimal,
-    provider: int | str | None, job_id: str | None, custom_id: str | None,
-) -> TextResult:
+def _text_result_from_chat_completion(body: dict, terms: dict) -> TextResult:
     choices = body.get("choices", []) or []
     text = "".join(c.get("message", {}).get("content") or "" for c in choices)
     raw_usage = body.get("usage", {}) or {}
@@ -330,19 +322,7 @@ def _text_result_from_chat_completion(
         "output_tokens": raw_usage.get("completion_tokens", 0),
         "total_tokens": raw_usage.get("total_tokens", 0),
     }
-    return TextResult(
-        text=text,
-        output=choices,
-        usage=usage,
-        raw=body,
-        rates=rates,
-        cost=_text_cost(usage, rates),
-        gas_fee=gas_fee,
-        fee=fee,
-        provider=provider,
-        job_id=job_id,
-        custom_id=custom_id,
-    )
+    return TextResult(text=text, output=choices, usage=usage, raw=body, **terms)
 
 
 def _decrypt_output(output: dict, cipher: "Cipher | None") -> dict:
@@ -405,6 +385,7 @@ def _result_from_output(output: dict, job: dict) -> Union[TextResult, MediaResul
     rates = _rates(vorq)
     gas_fee = wire_usd(vorq.get("gas_fee"), "vorq.gas_fee")
     fee = wire_usd(vorq.get("fee"), "vorq.fee")
+    settled = _settled(vorq)
     # The provider's correlation stamp, lifted off the sealed body before anything else reads
     # it: `raw` stays the model's own object, and the stamp is VORQ's, added outside it.
     # Only the caller's label is surfaced — the stamp's `job_id` is there for a human reading
@@ -413,22 +394,32 @@ def _result_from_output(output: dict, job: dict) -> Union[TextResult, MediaResul
     stamp = stamp if isinstance(stamp, dict) else {}
     if stamp:
         output = {k: v for k, v in output.items() if k != "vorq"}
-    custom_id = stamp.get("custom_id")
-    # `provider_id`, which is what the row carries — `clientJob` projects the
-    # chain's `providerId` and there is no `provider` key on it. Reading the
-    # wrong one is invisible: the result builds and `.provider` is just None.
-    provider = vorq.get("provider_id")
-    job_id = job["id"]
+    terms = {
+        "rates": rates,
+        "cost": _cost(settled, rates),
+        "gas_fee": gas_fee,
+        "fee": fee,
+        "prompt_tok": settled.prompt_tok,
+        "cached_tok": settled.cached_tok,
+        "completion_tok": settled.completion_tok,
+        "rate_in_cached": settled.rate_in_cached,
+        # `provider_id`, which is what the row carries — `clientJob` projects the
+        # chain's `providerId` and there is no `provider` key on it. Reading the
+        # wrong one is invisible: the result builds and `.provider` is just None.
+        "provider": vorq.get("provider_id"),
+        "job_id": job["id"],
+        "custom_id": stamp.get("custom_id"),
+    }
     if _is_embedding(output):
-        return _embedding_result(output, rates, gas_fee, fee, provider, job_id, custom_id)
+        return _embedding_result(output, terms)
     if _is_media(output):
-        return _media_result(output, rates, gas_fee, fee, provider, job_id, custom_id)
+        return _media_result(output, terms)
     if "choices" in output:
         # A job settled through the chat-completions preset carries a verbatim
         # ``chat.completion`` object; the native surface passes it through as-is,
         # so the chat-completion shape is parsed rather than the Responses one.
-        return _text_result_from_chat_completion(output, rates, gas_fee, fee, provider, job_id, custom_id)
-    return _text_result_from_response(output, rates, gas_fee, fee, provider, job_id, custom_id)
+        return _text_result_from_chat_completion(output, terms)
+    return _text_result_from_response(output, terms)
 
 
 def result_from_raw(
@@ -481,9 +472,9 @@ def result_from_batch_line(
     The old surface's inline "convenience copy" is gone with the thing it was a
     copy of, and with it the one way sealed bodies could be swapped between lines.
 
-    Each row carries its own line's rates — every line settles under its own
-    signed order — so cost is computed from those and never from a batch-level
-    average.
+    Each row carries its own line's rates and settled counts — every line settles
+    under its own signed order — so cost is computed from those and never from a
+    batch-level average.
     """
     vorq = line.get("vorq") or {}
     # `None` when the row carries a `vorq` block naming no job, and that is the
@@ -521,6 +512,10 @@ def result_from_batch_line(
                 "rate_out": vorq.get("rate_out"),
                 "gas_fee": vorq.get("gas_fee"),
                 "fee": vorq.get("fee"),
+                "prompt_tok": vorq.get("prompt_tok"),
+                "cached_tok": vorq.get("cached_tok"),
+                "completion_tok": vorq.get("completion_tok"),
+                "rate_in_cached": vorq.get("rate_in_cached"),
                 "provider_id": vorq.get("provider"),
             },
         },

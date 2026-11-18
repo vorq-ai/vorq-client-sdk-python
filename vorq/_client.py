@@ -179,9 +179,13 @@ def _declare_units(model_input: dict, units_out: int | None = None) -> tuple[int
     a per-image, per-megapixel, or per-second backend alike, so a bigger image or a
     higher resolution honestly costs more.
 
-    ``units_in`` is the quantity of input bought, and what that means depends on the
-    same shape. Text and embeddings are metered on the prompt, one unit per four bytes
-    of canonical JSON — a proxy, and a coarse one. Image and video are metered on the
+    ``units_in`` is the most input the order can be billed for, and what that means
+    depends on the same shape. Text and embeddings get a **ceiling**: the byte length
+    of the canonical JSON. Text runs about four bytes a token and the JSON wrapper adds
+    more, so it sits above the backend's prompt count, chat template included, for
+    anything longer than a few words. Settle bills the backend's own prompt count under
+    it and refunds the rest.
+    Image and video are metered on the
     **reference**: total pixel-seconds across the assets the request carries, and zero
     when it carries none. A prompt's length buys nothing on a media job, and counting
     it would price a job by how well its reference happened to compress.
@@ -203,7 +207,7 @@ def _declare_units(model_input: dict, units_out: int | None = None) -> tuple[int
 
     kind = _media.shape(model_input)
     if kind == "text":
-        units_in = max(1, len(_canonical_bytes(model_input)) // 4)
+        units_in = len(_canonical_bytes(model_input))
     else:
         units_in = _media.reference_units(model_input)
 
@@ -1292,6 +1296,11 @@ class Client:
             "input": payload_input,
         }
         if custom_id is not None:
+            # 1-64 characters, as on a batch line: the provider bounds the envelope
+            # frame by it when it checks units_in against the payload size.
+            if not isinstance(custom_id, str) or not custom_id or len(custom_id) > 64:
+                raise ValidationError("custom_id must be a 1-64 character string",
+                                      type="invalid_request_error")
             # Absent rather than null when unset: this dict is canonicalized into the
             # commitment preimage, so a key that carries no meaning must not be there.
             envelope["custom_id"] = custom_id
