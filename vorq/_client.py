@@ -215,7 +215,8 @@ def _declare_units(model_input: dict, units_out: int | None = None) -> tuple[int
 
     kind = _media.shape(model_input)
     if kind == "text":
-        units_in = len(_canonical_bytes(model_input))
+        units_in = (len(_canonical_bytes(model_input))
+                    + _media_units.TEXT_IMAGE_UNITS * _media.text_image_count(model_input))
     else:
         units_in = _media.reference_units(model_input)
 

@@ -252,6 +252,34 @@ def duration_secs(model_input: dict) -> int:
     return seconds if seconds > 0 else mu.DEFAULT_DURATION_S
 
 
+def text_image_count(model_input: Any) -> int:
+    """The image parts a text request carries, each priced at ``TEXT_IMAGE_UNITS``.
+
+    Every JSON object at any depth whose ``type`` is an image type counts, inline
+    or by URL: the provider re-counts the same way after decryption, so there is
+    no place to put an image that one side sees and the other does not. Media
+    nothing prices yet (sound, video, files) is refused, as is a request past
+    the cap.
+    """
+    count = 0
+    stack = [model_input]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            kind = node.get("type")
+            if isinstance(kind, str):
+                if kind in mu.TEXT_REFUSED_TYPES:
+                    raise _invalid(f"a {kind!r} part is not supported: only text and images are priced")
+                if kind in mu.TEXT_IMAGE_TYPES:
+                    count += 1
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    if count > mu.MAX_TEXT_IMAGES:
+        raise _invalid(f"the request carries {count} images; at most {mu.MAX_TEXT_IMAGES} are priced")
+    return count
+
+
 def shape(model_input: dict) -> str:
     """``"text"``, ``"image"`` or ``"video"`` — **one** decision, driving both units.
 

@@ -20,7 +20,7 @@ below raise `ValidationError` before anything is sealed.
 
 | Shape | `units_in` | `units_out` |
 | --- | --- | --- |
-| text | `len(canonical JSON of the input in UTF-8)` | the first ceiling present, in the order above, or `4096` |
+| text | `len(canonical JSON of the input in UTF-8)` + 32,768 × [images](#images-in-a-text-request) | the first ceiling present, in the order above, or `4096` |
 | image | [reference pixel-seconds](#reference-assets), or `0` | frame pixels × `num_images` (default 1) |
 | video | reference pixel-seconds, or `0` | frame pixels × duration seconds |
 
@@ -29,6 +29,22 @@ below raise `ValidationError` before anything is sealed.
 For text, `units_in` is the request's byte length: a ceiling that sits above the model's own
 prompt count for anything but a few-word prompt. Settlement bills the model's count and refunds
 the unused part.
+
+### Images in a text request
+
+Every JSON object in the input whose `type` is `image_url` or `input_image` is one image, at any
+depth, inline or by URL. Each adds 32,768 to `units_in`: a ceiling on one image's prompt tokens,
+above the largest vision encoder served (about 16,650 tokens for a 4096-pixel image read at
+native resolution). Settlement bills the model's own count.
+
+| Rule | Value |
+| --- | --- |
+| Images per request | at most 64 |
+| Refused part types | `input_audio`, `audio_url`, `video_url`, `input_video`, `file`, `input_file` |
+
+A refused request raises `ValidationError` before anything is signed. A provider re-counts after
+decrypting and hands back an order whose `units_in` is short, so a hand-built order can't buy
+images at text prices.
 
 ## Frame pixels
 

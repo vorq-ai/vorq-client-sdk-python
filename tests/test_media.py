@@ -48,7 +48,35 @@ def test_the_case_list_has_not_quietly_shrunk():
     names = {c["name"] for c in CASES}
     assert {"legacy-image-pixels", "tiered-video-string-duration", "reference-image-to-video",
             "reference-start-and-end-frame", "reference-clip", "plain-text-is-untouched",
-            "an-explicit-zero-output-survives"} <= names
+            "an-explicit-zero-output-survives", "an-image-by-url-is-priced-as-an-image",
+            "an-image-at-any-depth-counts"} <= names
+
+
+# --- images in a text request ---------------------------------------------------
+
+
+def _chat(*parts):
+    return {"messages": [{"role": "user", "content": list(parts)}], "max_tokens": 8}
+
+
+def test_each_image_adds_its_ceiling_on_top_of_the_bytes():
+    url = {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+    bare, _ = _declare_units(_chat({"type": "text", "text": "x"}))
+    one, _ = _declare_units(_chat({"type": "text", "text": "x"}, url))
+    assert one - bare - len(json.dumps(url, separators=(",", ":"))) - 1 == mu.TEXT_IMAGE_UNITS
+
+
+@pytest.mark.parametrize("kind", sorted(mu.TEXT_REFUSED_TYPES))
+def test_unpriced_media_in_a_text_request_is_refused(kind):
+    with pytest.raises(ValidationError, match=kind):
+        _declare_units(_chat({"type": kind, kind: {"data": "AA=="}}))
+
+
+def test_more_images_than_the_cap_is_refused():
+    url = {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+    _declare_units(_chat(*[url] * mu.MAX_TEXT_IMAGES))
+    with pytest.raises(ValidationError, match="images"):
+        _declare_units(_chat(*[url] * (mu.MAX_TEXT_IMAGES + 1)))
 
 
 # --- aspect resolution ---------------------------------------------------------

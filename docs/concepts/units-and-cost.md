@@ -23,14 +23,17 @@ as pixels on the other. A string `input` is always text.
 
 | Shape | `units_in` | `units_out` |
 | --- | --- | --- |
-| text | the input's canonical JSON length in bytes | the output-token ceiling, or 4096 |
+| text | the input's canonical JSON length in bytes, plus 32,768 per image | the output-token ceiling, or 4096 |
 | image | reference pixel-seconds, or 0 | frame pixels × `num_images` |
 | video | reference pixel-seconds, or 0 | frame pixels × seconds |
 
 For text, `units_in` is a ceiling on the prompt, not a count. Text runs about four bytes a token
 and the JSON wrapper adds more, so the byte length sits above the model's own prompt count, chat
 template included, for anything longer than a few words. Settlement bills the model's own prompt
-count, never more than `units_in`, and refunds the rest. For media, the
+count, never more than `units_in`, and refunds the rest. An image in a text request adds
+32,768 units whether it is inline or a URL, since its token count has nothing to do with its
+size in bytes. That is a ceiling above any vision model served, and the unused part is refunded
+the same way. For media, the
 prompt's length doesn't count: the input side is the reference assets you attach, and that
 count is what settles. Frame sizes, defaults and
 asset rules are in [Units and media inputs](../reference/units.md).
