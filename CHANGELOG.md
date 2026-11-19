@@ -8,7 +8,7 @@ Every release bumps the patch version (`0.2.0`, `0.2.1`, …), so `vorq~=0.2.0` 
 and a plain `pip install -U vorq` always gets the newest. A breaking change bumps the minor
 (`0.3.0`).
 
-## [0.3.0] — Unreleased
+## [0.3.0] — 2026-11-19
 
 ### Changed
 
