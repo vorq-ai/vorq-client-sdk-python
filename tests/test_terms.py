@@ -29,6 +29,7 @@ from vorq._crypto import (
     ORDER_TYPES,
     RECEIVE_AUTHORIZATION_TYPES,
     SESSION_TYPES,
+    WITHDRAW_TYPES,
     WalletSigner,
     content_job_id,
     vorq_domain,
@@ -65,8 +66,9 @@ CTX = ChainContext(
 
 #: The vectors' own client wallet — anvil index 4. Which key signs is free for
 #: the orders, the cancel and the session, where recovery only has to return
-#: *this* address. It is not free for `payment-authorization`: `from` is a signed
-#: member, so only the wallet the vector names there reaches its digest at all.
+#: *this* address. It is not free for `payment-authorization` (the deposit's
+#: `ReceiveWithAuthorization`): `from` is a signed member, so only the wallet the
+#: vector names there reaches its digest at all.
 VECTOR_KEY = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a"
 
 
@@ -229,13 +231,16 @@ class TestTypeTables:
     def test_the_authorization_table_is_the_one_the_token_verifies(self):
         assert RECEIVE_AUTHORIZATION_TYPES == local_types("payment-authorization")
 
+    def test_the_withdraw_table_is_the_one_the_contract_verifies(self):
+        assert WITHDRAW_TYPES == local_types("withdraw")
+
     def test_the_session_table_matches(self):
         """No contract verifies a session, so this file and the coordinator are the
         only two places it exists — which is exactly why it needs a vector."""
         assert SESSION_TYPES == local_types("session")
 
     def test_no_signed_table_carries_a_cid(self):
-        for table in (ORDER_TYPES, CANCEL_TYPES):
+        for table in (ORDER_TYPES, CANCEL_TYPES, WITHDRAW_TYPES):
             for members in table.values():
                 assert not [f for f in members if "cid" in f["name"].lower()]
 
@@ -430,10 +435,12 @@ class TestCancelVector:
         assert raw("cancel")["jobId"] == extra("order-designated")["job_id"]
 
 
-# -- the payment authorization -------------------------------------------------
+# -- the deposit authorization -------------------------------------------------
 
 
-class TestPaymentAuthorizationVector:
+class TestDepositAuthorizationVector:
+    """A deposit is the token's own ``ReceiveWithAuthorization``, payee the JobRegistry."""
+
     def test_the_digest_matches_the_tokens_own(self):
         assert _digest(
             payment_domain(CTX), RECEIVE_AUTHORIZATION_TYPES, message("payment-authorization")
@@ -447,42 +454,44 @@ class TestPaymentAuthorizationVector:
             signable, signature=CASES["payment-authorization"]["signature"]
         ) == CASES["payment-authorization"]["signer"]
 
-    def test_sign_payment_authorization_lands_on_the_vector(self):
+    def test_sign_deposit_authorization_lands_on_the_vector(self):
         """The SDK's own entry point, not a hand-built message."""
         signer = WalletSigner(VECTOR_KEY)
         m, r = message("payment-authorization"), raw("payment-authorization")
-        sig = signer.sign_payment_authorization(
-            amount=int(m["value"]), job_id=r["nonce"],
-            expires_at=int(m["validBefore"]) - 1, ctx=CTX,
+        sig = signer.sign_deposit_authorization(
+            int(m["value"]), r["nonce"], int(m["validBefore"]), CTX,
         )
         assert recover_against_vector("payment-authorization", sig) == signer.address
         # `from` is signed, so exactly one wallet reaches this digest — which is
         # what the assertion above is worth only if this holds.
         assert r["from"] == signer.address
 
-    def test_the_nonce_is_the_job_id_and_is_not_chosen_here(self):
-        """One authorization per job: the token's own nonce table makes it
-        single-use, and only the payee can execute it, so an authorization for
-        another job or another payee funds nothing here."""
+    def test_the_payee_is_the_job_registry_and_it_is_valid_at_once(self):
         m, r = message("payment-authorization"), raw("payment-authorization")
-        assert r["nonce"] == extra("payment-authorization")["job_id"]
         assert r["to"] == CTX.job_registry
         assert m["validAfter"] == 0
 
-    def test_the_window_is_the_orders_own_plus_one_second(self):
-        """The token requires `now < validBefore` and a claim may land exactly on
-        `expires_at`, so the authorization is open one second longer."""
-        signer = WalletSigner(VECTOR_KEY)
-        m, r = message("payment-authorization"), raw("payment-authorization")
-        args = dict(amount=int(m["value"]), job_id=r["nonce"], ctx=CTX)
-        assert signer.sign_payment_authorization(
-            expires_at=int(m["validBefore"]) - 1, **args
-        ) != signer.sign_payment_authorization(expires_at=int(m["validBefore"]), **args)
 
-    def test_the_amount_is_the_one_claim_will_pull(self):
-        assert int(raw("payment-authorization")["value"]) == int(
-            extra("payment-authorization")["amount"]
-        )
+# -- the withdrawal --------------------------------------------------------------
+
+
+class TestWithdrawVector:
+    def test_it_lives_on_the_job_registry_domain(self):
+        assert CASES["withdraw"]["typed_data"]["domain"] == order_domain(CTX)
+
+    def test_the_digest_matches_the_contracts_own(self):
+        assert _digest(order_domain(CTX), WITHDRAW_TYPES, message("withdraw")) == CASES["withdraw"]["digest"]
+
+    def test_the_signature_recovers_to_the_vectors_signer(self):
+        assert recover_against_vector(
+            "withdraw", CASES["withdraw"]["signature"]
+        ) == CASES["withdraw"]["signer"]
+
+    def test_sign_withdraw_lands_on_the_vector(self):
+        signer = WalletSigner(Account.create().key.hex())
+        r = raw("withdraw")
+        sig = signer.sign_withdraw(int(r["amount"]), int(r["issuedAt"]), CTX)
+        assert recover_against_vector("withdraw", sig) == signer.address
 
 
 # -- the session handshake -----------------------------------------------------

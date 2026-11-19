@@ -8,6 +8,34 @@ Every release bumps the patch version (`0.2.0`, `0.2.1`, …), so `vorq~=0.2.0` 
 and a plain `pip install -U vorq` always gets the newest. A breaking change bumps the minor
 (`0.3.0`).
 
+## [0.3.0] — Unreleased
+
+### Changed
+
+- **Breaking:** jobs are paid from a prepaid balance in the job registry. A submission no
+  longer signs a payment per job: the complete `POST /v1/jobs` body carries the quoted `amount`
+  and no `auth_sig`, and a batch line likewise. The quote carries `balance`, `deposit` and
+  `deposit_fee`, and its `authorization` block is gone.
+- **Breaking:** `Signer.sign_payment_authorization` is replaced by
+  `sign_deposit_authorization(amount, nonce, valid_before, ctx)`, a deposit into the balance
+  with a random 32-byte nonce and a one-hour deadline. A custom signer implements it and
+  `sign_withdraw`.
+- When the quote shows the balance short, `submit` deposits the shortfall first with one
+  gasless signature, and `batches.submit` deposits the batch's shortfall once before the
+  upload. The wallet needs USDC and no ETH.
+- An order that expires unclaimed costs nothing.
+
+### Added
+
+- `Client.balance()`, `Client.deposit(amount)` and `Client.withdraw(amount)`, amounts as USD
+  decimal strings.
+- `Client(auto_deposit=...)`, default `True`. With `False`, a short balance raises the new
+  `InsufficientBalance` (`.balance`, `.required`, `.shortfall`) and nothing is posted.
+- `Signer.sign_withdraw(amount, issued_at, ctx)`, signing `Withdraw(uint128 amount,uint64 issuedAt)`
+  on the job registry's domain.
+- `VorqError.code` (`str | None`), the wire `error.code`. A withdrawal over `available` is a
+  `StateConflictError` with `.code == "insufficient_balance"`.
+
 ## [0.2.2] — 2026-11-18
 
 ### Changed

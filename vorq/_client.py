@@ -40,9 +40,10 @@ from ._models import Models
 from ._params import check_input
 from ._sla import normalize_sla, sla_seconds, window_from_seconds
 from ._money import format_usd, usd_arg, usd_atomic, wire_atomic, wire_usd
-from ._terms import ChainContext, OrderTerms, payment_domain
+from ._terms import ChainContext, OrderTerms
 from .errors import (
     EscrowKeyUnverified,
+    InsufficientBalance,
     NotFoundError,
     ValidationError,
     VerificationError,
@@ -112,6 +113,14 @@ MAX_SUBMIT_ATTEMPTS = 3
 #: and not an edge one.
 MAX_EXPIRY_SECONDS = 86400
 
+#: How long a deposit authorization stays executable, in seconds. The client
+#: sends it at once and the node relays it at once, so an hour is ample.
+DEPOSIT_VALIDITY_S = 3600
+
+#: The money fields of the balance body (``GET /v1/balance``, and the answer to
+#: a deposit or a withdrawal).
+_BALANCE_FIELDS = ("balance", "reserved", "available", "deposit_fee")
+
 
 def _resolve_gateway(gateway: str | None) -> str | None:
     """Explicit argument > ``$VORQ_PIN_GATEWAY`` > built-in default.
@@ -128,9 +137,8 @@ def _resolve_gateway(gateway: str | None) -> str | None:
     return gateway.rstrip("/") or None
 
 
-# The payment authorization must stay valid until the job settles — cover the full
-# SLA window plus this margin so a long ``batch`` (24h) order does not expire before
-# ``/settle``. Configurable via ``$VORQ_SETTLEMENT_MARGIN`` (seconds).
+# An order stays claimable for the full SLA window plus this margin, clamped to the
+# chain's ceiling. Configurable via ``$VORQ_SETTLEMENT_MARGIN`` (seconds).
 SETTLEMENT_MARGIN = int(os.environ.get("VORQ_SETTLEMENT_MARGIN", "3600"))
 
 
@@ -240,12 +248,12 @@ def _cap(terms: "OrderTerms") -> int:
     arithmetic end to end, and the floor of 1 is the contract's own: an order that
     priced to zero would commit nothing and could be claimed for free.
 
-    Written out here because a batch line authorizes its payment without being
-    quoted. The single-job path asks the node for this number and signs what it
-    was quoted; a batch of 50 000 lines cannot ask 50 000 times, so it computes
-    the same value and reads only the fees that ride on top of it from the
-    network. The node re-derives it and refuses a line that cannot cover the pull,
-    so a disagreement here is a skipped line and never a silent underpayment.
+    Written out here because a batch line states its amount without being
+    quoted. The single-job path asks the node for this number; a batch of 50 000
+    lines cannot ask 50 000 times, so it computes the same value and reads only
+    the fees that ride on top of it from the network. The node re-derives it and
+    refuses a line whose amount disagrees, so a disagreement here is a skipped
+    line and never a silent underpayment.
     """
     scaled = terms.rate_in * terms.units_in + terms.rate_out * terms.units_out
     return max(1, -(-scaled // RATE_SCALE))
@@ -272,7 +280,7 @@ class _SealMemo:
 
 @dataclass(frozen=True)
 class SealedLine:
-    """One batch line, sealed and signed but not yet paid.
+    """One batch line, sealed and signed but not yet priced.
 
     Frozen because it is the client's own record of what it committed to: the
     container is already encrypted under a seed this process will not mint again,
@@ -321,6 +329,21 @@ def _candidates(body: Any) -> list[dict]:
         rates = {k: wire_usd(c[k], f"candidates[].{k}", 402) for k in ("rate_in", "rate_out") if k in c}
         kept.append({**c, "provider_id": pid, "box_key": box_key, **rates})
     return kept
+
+
+@dataclass(frozen=True)
+class _Quote:
+    """A ``402``/``409`` quote, atomic: what the job locks and what funds it.
+
+    ``deposit`` is ``0`` when the available ``balance`` covers ``amount``, and
+    otherwise the shortfall plus ``deposit_fee`` — the exact value a deposit
+    authorization signs.
+    """
+
+    amount: int
+    balance: int
+    deposit: int
+    deposit_fee: int
 
 
 @dataclass(frozen=True)
@@ -385,6 +408,13 @@ class Client:
     exception, and they are not an exception to the trust boundary — they are
     content-addressed, so they come off the storage gateway by CID (``gateway``,
     or ``$VORQ_PIN_GATEWAY``) and the name is the whole entitlement.
+
+    Jobs are paid from the wallet's **prepaid balance** in the JobRegistry. A
+    submission the balance does not cover deposits the shortfall first — one
+    gasless EIP-3009 authorization the node relays, so the wallet holds USDC
+    and never needs ETH. Pass ``auto_deposit=False`` to deposit explicitly with
+    :meth:`deposit` and have a short balance raise
+    :class:`~vorq.errors.InsufficientBalance` instead.
     """
 
     _REFRESH_SKEW = 60.0  # re-mint this many seconds before the token expires
@@ -400,6 +430,7 @@ class Client:
         transport: httpx.AsyncBaseTransport | None = None,
         verifier: "Verifier | None" = None,
         gateway: str | None = None,
+        auto_deposit: bool = True,
     ) -> None:
         resolved = signer if signer is not None else _default_signer()
         if resolved is None:
@@ -417,6 +448,7 @@ class Client:
             session_token=None,
             verifier=verifier,
             gateway=gateway,
+            auto_deposit=auto_deposit,
         )
 
     @classmethod
@@ -432,6 +464,7 @@ class Client:
         transport: httpx.AsyncBaseTransport | None = None,
         verifier: "Verifier | None" = None,
         gateway: str | None = None,
+        auto_deposit: bool = True,
     ) -> "Client":
         """Build a client from a pre-minted ``vorq_sess_…`` token.
 
@@ -450,6 +483,7 @@ class Client:
             session_token=token,
             verifier=verifier,
             gateway=gateway,
+            auto_deposit=auto_deposit,
         )
         return self
 
@@ -465,6 +499,7 @@ class Client:
         session_token: str | None,
         verifier: "Verifier | None",
         gateway: str | None = None,
+        auto_deposit: bool = True,
     ) -> None:
         # Job state reads from the coordinator, and result bytes come straight off
         # the storage network by name. That is not a default with an alternative
@@ -476,6 +511,12 @@ class Client:
         self.timeout = timeout
         self.max_retries = max_retries
         self.signer = signer
+        #: Whether a submission whose quote asks for a deposit makes it silently.
+        #: Off, a short balance raises :class:`~vorq.errors.InsufficientBalance`.
+        self.auto_deposit = auto_deposit
+        # The last ``issued_at`` this client signed a withdrawal with: the contract
+        # takes only a strictly later one per owner, so two in one second differ.
+        self._last_withdraw_issued_at = 0
         # An explicit cipher always wins (contract wallet, KMS, a key persisted
         # elsewhere). Otherwise a wallet derives its own result cipher — nothing to
         # configure and nothing to lose — and only a signerless client falls back
@@ -650,9 +691,10 @@ class Client:
         chosen provider (the first candidate) or, when the probe names nobody,
         to the pin or the coordinator's escrow key (the key itself never
         travels) — signs the order over that container's commitment, challenges
-        for that order's quote, signs the payment authorization, and posts terms
-        and bytes together. **The container crosses the wire once**, and the
-        answer carries the ``task_cid`` the coordinator's storage service minted.
+        for that order's quote, deposits any shortfall in the prepaid balance
+        (see ``auto_deposit``), and posts terms and bytes together. **The
+        container crosses the wire once**, and the answer carries the
+        ``task_cid`` the coordinator's storage service minted.
 
         ``max_rate_in`` / ``max_rate_out`` are the most the order pays, in USD
         per 1M units of work, as a ``str`` or ``Decimal`` (``"0.05"``); an
@@ -750,18 +792,17 @@ class Client:
             atomic_in, atomic_out, units_in, units_out, ctx,
         )
         container, job_id, vorq = order.container, order.job_id, order.vorq
-        expires_at = order.terms.expires_at
 
         # -- phase 1: the terms-only challenge -------------------------------
         #
         # No bytes leave the client here. The quote is arithmetic over the signed
         # terms plus one cached gas read, so the challenge needs no payload — and
-        # a client that sent one anyway would be told to sign a quote and come
+        # a client that sent one anyway would be told to fund a quote and come
         # back, uploading the same megabytes a second time.
-        amount, _ = await self._challenge(vorq, job_id, ctx, expires_at)
+        quote = await self._challenge(vorq, ctx)
 
         # The container's one field on the wire, resolved **once** and on first
-        # use: a 409 re-quote below changes only the payment, never the bytes, so
+        # use: a 409 re-quote below changes only the amount, never the bytes, so
         # filing them again on every attempt would be a wasted upload per
         # re-quote. Deferred rather than computed here because *when* the bytes
         # are filed decides how much of the node's 300 s orphan window a
@@ -775,27 +816,24 @@ class Client:
         # node's own `neverChallengeAfterBytes` hook rewrites such an answer to a
         # `400 container_without_payment`. The one status that legitimately sends
         # a complete submission back is a `409` carrying a `quote` — the gas fee
-        # drifted — and it arrives in the `402`'s own body shape, which is why
-        # "sign this quote" is one code path here whatever status delivered it.
+        # drifted, or the balance no longer covers the job — and it arrives in
+        # the `402`'s own body shape, which is why "fund this quote" is one code
+        # path here whatever status delivered it.
         # The two `409`s are told apart by **body** and never by status.
         for _ in range(MAX_SUBMIT_ATTEMPTS):
             # The same flat fields the challenge sent, plus the container's
-            # field and the payment. Only the payment moves between attempts, so
-            # a drifting gas fee never costs a fresh seed, a fresh `c` or a
+            # field and the amount. Only the amount moves between attempts, so
+            # a drifting quote never costs a fresh seed, a fresh `c` or a
             # second upload of the payload.
-            # The payment first, the container second, and as two statements
-            # rather than one literal: the order of effects is the point, and
-            # dict ordering would not enforce it.
-            auth_sig = self.signer.sign_payment_authorization(
-                amount=amount, job_id=job_id, expires_at=expires_at, ctx=ctx,
-            )
+            # The deposit first, the container second: the order of effects is
+            # the point (see `_container_field`).
+            await self._fund(quote, ctx)
             if content_field is None:
                 content_field = await self._container_field(container)
             fields = {
                 **vorq,
                 **content_field,
-                "auth_sig": auth_sig,
-                "amount": format_usd(amount, ctx.decimals),
+                "amount": format_usd(quote.amount, ctx.decimals),
             }
             sent = await self._send_complete(fields, job_id)
             if isinstance(sent, dict):  # the pre-check found it already posted
@@ -814,15 +852,15 @@ class Client:
                 if isinstance(refusal, dict) and "quote" in refusal:
                     # Not a challenge: a refusal with the remedy attached. The
                     # terms and `c` are unchanged, so the container is reused
-                    # verbatim and only the payment is re-signed.
-                    amount = self._quote(refusal, job_id, ctx, expires_at)
+                    # verbatim and only the amount and the deposit are redone.
+                    quote = self._quote(refusal, ctx)
                     continue
                 raise self._error(sent)  # the chain refused it
             return self._handle_from_job(sent.json(), window)
         raise VorqError(
             f"the node re-quoted this submission {MAX_SUBMIT_ATTEMPTS} times without "
-            "accepting it; the gas fee is drifting faster than the order can be "
-            "signed, so the container is not uploaded again",
+            "accepting it; the quote is drifting faster than the order can be "
+            "funded, so the container is not sent again",
             type="api_error",
             status_code=409,
         )
@@ -977,16 +1015,14 @@ class Client:
         )
         return _SignedOrder(container, job_id, terms, vorq)
 
-    async def _challenge(
-        self, vorq: dict, job_id: str, ctx: ChainContext, expires_at: int
-    ) -> tuple[int, dict]:
-        """The terms-only `POST /v1/jobs`: the amount it quotes, and the raw body."""
+    async def _challenge(self, vorq: dict, ctx: ChainContext) -> _Quote:
+        """The terms-only `POST /v1/jobs`: the quote it answers."""
         resp = await self._request(
             "POST", "/v1/jobs", json=vorq,
             retry=False, allow_statuses=frozenset({402}),
         )
         # A terms-only body has exactly one answer, and it is the quote. The node
-        # returns `402` unconditionally when `auth_sig` is absent, and a success
+        # returns `402` unconditionally when the container is absent, and a success
         # here would mean a job posted with **no container**, which names no task
         # and is refused on chain as `EmptyTaskCid`. So a non-402 is not a
         # shortcut, it is a server this client does not know.
@@ -998,13 +1034,12 @@ class Client:
                 type="api_error",
                 status_code=resp.status_code,
             )
-        body = resp.json()
-        return self._quote(body, job_id, ctx, expires_at), body
+        return self._quote(resp.json(), ctx)
 
     def _expires_at(self, window: str) -> int:
         """When the order stops being postable, clamped to the chain's own ceiling.
 
-        The payment authorization must outlive the work, so the SLA window plus
+        The order must stay claimable for the work, so the SLA window plus
         :data:`SETTLEMENT_MARGIN` is the wanted value — but ``JobRegistry``
         refuses anything past ``now + 86400``, and the ``24h`` window already
         reaches it. Clamping here is what keeps the ordinary long-window
@@ -1013,57 +1048,157 @@ class Client:
         now = int(time.time())
         return now + min(sla_seconds(window) + SETTLEMENT_MARGIN, MAX_EXPIRY_SECONDS)
 
-    def _quote(self, body: Any, job_id: str, ctx: ChainContext, expires_at: int) -> int:
-        """Read a ``402``/``409`` quote, refusing one that is not about this job.
+    def _quote(self, body: Any, ctx: ChainContext) -> _Quote:
+        """Read a ``402``/``409`` quote: the amount the job locks and how it is funded.
 
-        **This client signs what it derives; the quote supplies the amount and
-        nothing else.** ``quote.amount`` is a USD string; the atomic integer it
-        names at the token's decimals is what is signed, and the quoted
-        authorization's ``value`` must be that same integer. The block is read member
-        for member and has to agree: a node that describes a different
-        authorization than the one this client is about to sign is a node on
-        another deployment, and signing anyway would produce an unclaimable job
-        rather than a refusal.
+        All four members are USD strings and all four are required. ``deposit``
+        is what this client would sign into the balance, so it is bounded here:
+        ``0``, or above ``deposit_fee`` (a deposit that covers only its own fee
+        credits nothing) and at most ``amount + deposit_fee`` (a node asking for
+        more than the job could ever lock is not one to sign for).
         """
         quote = body.get("quote") if isinstance(body, dict) else None
-        auth = quote.get("authorization") if isinstance(quote, dict) else None
         if not isinstance(quote, dict):
             raise VorqError(
                 "the node answered a challenge with no quote to sign",
                 type="api_error", status_code=402,
             )
-        if not isinstance(auth, dict) or "amount" not in quote:
+        missing = [k for k in ("amount", "balance", "deposit", "deposit_fee") if k not in quote]
+        if missing:
             raise VorqError(
-                "the node's quote names no amount and authorization this client can check",
+                f"the node's quote names no {', '.join(missing)}",
                 type="api_error", status_code=402,
             )
-        amount = wire_atomic(quote["amount"], "quote.amount", ctx.decimals, 402)
-        domain = auth.get("domain") if isinstance(auth.get("domain"), dict) else {}
-        want = payment_domain(ctx)
-
-        def same(a: Any, b: str) -> bool:
-            return isinstance(a, str) and a.lower() == b.lower()
-
-        def num(v: Any) -> int | None:
-            return v if isinstance(v, int) and not isinstance(v, bool) else None
-
-        agrees = (
-            num(domain.get("chainId")) == ctx.chain_id
-            and same(domain.get("verifyingContract"), ctx.usdc)
-            and domain.get("name") == want["name"]
-            and domain.get("version") == want["version"]
-            and same(auth.get("to"), ctx.job_registry)
-            and same(auth.get("nonce"), job_id)
-            and num(auth.get("value")) == amount
-            and num(auth.get("valid_after")) == 0
-            and num(auth.get("valid_before")) == expires_at + 1
-        )
-        if not agrees:
+        read = {
+            k: wire_atomic(quote[k], f"quote.{k}", ctx.decimals, 402)
+            for k in ("amount", "balance", "deposit", "deposit_fee")
+        }
+        q = _Quote(**read)
+        if q.deposit and not q.deposit_fee < q.deposit <= q.amount + q.deposit_fee:
             raise VorqError(
-                "the quoted authorization is not the one this client derives for this job "
-                "and deployment", type="api_error", status_code=402,
+                f"the node quoted a deposit of {quote['deposit']} for an amount of "
+                f"{quote['amount']} at a deposit fee of {quote['deposit_fee']}; a deposit "
+                "is above its fee and at most the amount plus the fee",
+                type="api_error", status_code=402,
             )
-        return amount
+        return q
+
+    async def _fund(self, quote: _Quote, ctx: ChainContext) -> None:
+        """Deposit what the quote asks for, or refuse when auto-deposit is off."""
+        if not quote.deposit:
+            return
+        if not self.auto_deposit:
+            shortfall = quote.deposit - quote.deposit_fee
+            raise self._insufficient(quote.balance, quote.amount, shortfall, ctx)
+        await self._deposit_value(quote.deposit, ctx)
+
+    @staticmethod
+    def _insufficient(
+        balance: int, required: int, shortfall: int, ctx: ChainContext
+    ) -> InsufficientBalance:
+        b, r, s = (format_usd(v, ctx.decimals) for v in (balance, required, shortfall))
+        return InsufficientBalance(
+            f"the available balance of {b} USD does not cover the {r} USD this needs; "
+            f"deposit at least {s} USD with client.deposit(...), or build the client "
+            "with auto_deposit=True",
+            balance=b, required=r, shortfall=s,
+        )
+
+    async def _cover(self, required: int, ctx: ChainContext) -> None:
+        """Make the available balance cover ``required``: one deposit of the shortfall, or a refusal."""
+        body = await self.balance()
+        available = wire_atomic(body["available"], "available", ctx.decimals)
+        if required <= available:
+            return
+        shortfall = required - available
+        if not self.auto_deposit:
+            raise self._insufficient(available, required, shortfall, ctx)
+        fee = wire_atomic(body["deposit_fee"], "deposit_fee", ctx.decimals)
+        await self._deposit_value(shortfall + fee, ctx)
+
+    # -- balance -----------------------------------------------------------
+
+    def _owner(self) -> str:
+        if self.signer is None:
+            raise ValidationError(
+                "the balance belongs to a wallet: configure VORQ_WALLET_KEY "
+                "(or pass signer=...)",
+                type="invalid_request_error",
+            )
+        return self.signer.address
+
+    @staticmethod
+    def _balance_body(body: Any) -> dict:
+        """The balance body, its money checked as canonical USD strings."""
+        if not isinstance(body, dict):
+            raise VorqError("the node answered a balance that is not an object", type="api_error")
+        for k in _BALANCE_FIELDS:
+            wire_usd(body.get(k), k)
+        return body
+
+    async def balance(self) -> dict:
+        """This wallet's prepaid balance (``GET /v1/balance``).
+
+        Returns ``{"owner", "balance", "reserved", "available", "deposit_fee"}``,
+        money as USD strings: ``balance`` is what the JobRegistry holds for the
+        wallet, ``reserved`` what its open orders will lock when claimed, and
+        ``available`` the difference — what a new submission can draw on.
+        """
+        resp = await self._request("GET", "/v1/balance", params={"owner": self._owner()})
+        return self._balance_body(resp.json())
+
+    async def deposit(self, amount: str | Decimal) -> dict:
+        """Credit ``amount`` USD to the prepaid balance; returns the balance body.
+
+        Signs one gasless EIP-3009 authorization for ``amount`` plus the
+        network's ``deposit_fee`` and the node relays it — the wallet needs USDC
+        and no ETH. ``amount`` is a ``str`` or ``Decimal`` (``"5"``, ``"0.25"``).
+        """
+        self._owner()
+        ctx = await self.chain_context()
+        atomic = usd_atomic(usd_arg(amount, "amount"), "amount", ctx.decimals)
+        if not atomic:
+            raise ValidationError("amount must be a positive USD string", type="invalid_request_error")
+        fee = wire_atomic((await self.balance())["deposit_fee"], "deposit_fee", ctx.decimals)
+        return await self._deposit_value(atomic + fee, ctx)
+
+    async def _deposit_value(self, value: int, ctx: ChainContext) -> dict:
+        """Sign and send one deposit authorization for exactly ``value`` atomic units."""
+        owner = self._owner()
+        assert self.signer is not None
+        nonce = "0x" + os.urandom(32).hex()
+        valid_before = int(time.time()) + DEPOSIT_VALIDITY_S
+        resp = await self._request("POST", "/v1/deposits", json={
+            "owner": owner,
+            "value": format_usd(value, ctx.decimals),
+            "valid_before": valid_before,
+            "nonce": nonce,
+            "auth_sig": self.signer.sign_deposit_authorization(value, nonce, valid_before, ctx),
+        })
+        return self._balance_body(resp.json())
+
+    async def withdraw(self, amount: str | Decimal) -> dict:
+        """Withdraw ``amount`` USD from the available balance to the wallet; returns the balance body.
+
+        Signs ``Withdraw(amount, issuedAt)`` and the node relays it, gasless like
+        a deposit. ``amount`` is a ``str`` or ``Decimal``; more than ``available``
+        is refused.
+        """
+        owner = self._owner()
+        assert self.signer is not None
+        ctx = await self.chain_context()
+        atomic = usd_atomic(usd_arg(amount, "amount"), "amount", ctx.decimals)
+        if not atomic:
+            raise ValidationError("amount must be a positive USD string", type="invalid_request_error")
+        issued_at = max(int(time.time()), self._last_withdraw_issued_at + 1)
+        self._last_withdraw_issued_at = issued_at
+        resp = await self._request("POST", "/v1/withdrawals", json={
+            "owner": owner,
+            "amount": format_usd(atomic, ctx.decimals),
+            "issued_at": issued_at,
+            "signature": self.signer.sign_withdraw(atomic, issued_at, ctx),
+        })
+        return self._balance_body(resp.json())
 
     async def _container_field(self, container: bytes) -> dict[str, str]:
         """The container's one field on the wire — decided **once** per submission.
@@ -1072,17 +1207,16 @@ class Client:
         otherwise filed first (``POST /v1/files``, ``purpose=input``) and named
         by ``container_cid``, the upload's ``vorq.cid``. Called once per
         submission, from inside :meth:`_submit_encrypted`'s re-quote loop but
-        memoised by its caller, so a `409` re-quote changes only the payment and
+        memoised by its caller, so a `409` re-quote changes only the amount and
         never re-files the bytes.
 
-        **Called after the payment is signed, not before.** An upload nobody
-        attaches is deleted by the node after 300 s, and signing is where a
-        submission can wait on a person — a hardware wallet, a remote signer, the
-        browser dialog the JS SDK shares this flow with. Filing ahead of it
-        spends that window on a prompt, and an upload the sweep collects makes a
-        post the node refuses ``unknown_container`` and marks not retryable. The
-        payment does not depend on the container, so signing first costs nothing
-        and a caller who declines never uploads at all.
+        **Called after any deposit, not before.** An upload nobody attaches is
+        deleted by the node after 300 s, and a deposit is where a submission can
+        wait on a person — a hardware wallet, a remote signer — and on a relayed
+        transaction. Filing ahead of it spends that window, and an upload the
+        sweep collects makes a post the node refuses ``unknown_container`` and
+        marks not retryable. The deposit does not depend on the container, so
+        making it first costs nothing and a caller who declines never uploads.
         """
         if len(container) <= INLINE_MAX_BYTES:
             return {"container": base64.b64encode(container).decode()}
@@ -1111,24 +1245,11 @@ class Client:
         Returns the response, or the job dict when the connection dropped and the
         job turned out to be posted after all.
 
-        JSON, flat — ``fields`` already carries the order, the payment, and
+        JSON, flat — ``fields`` already carries the order, the amount, and
         whichever of the container's two wire shapes :meth:`_container_field`
         decided. Nothing here uploads: that already happened, once, before this
         was ever called — so the dropped-connection retry below simply re-posts
         this same body, never a second upload.
-
-        **The pre-check is the mechanism, not an optimisation, and it must not be
-        replaced by server-side idempotency later.** The coordinator investigated
-        exactly that and proved it impossible: its ``jobs`` table is a pure
-        projection of the ``Posted`` event, which carries *neither* signature, and
-        every field a comparison could be built from — owner, ``c``, the rates,
-        the unit counts, ``expiresAt``, even ``task_cid``, whose mint is
-        content-addressed — is public calldata that a front-runner copies verbatim
-        out of the mempool. A server comparing those columns would hand an
-        attacker's job row back to this client as its own, complete with a
-        ``job_id``, a ``task_cid`` and a ``tx_hash``, for a job whose ``auth_sig``
-        is garbage and which no provider can ever claim. That is strictly worse
-        than the refusal it would replace.
 
         What makes the client side sound is the one thing the server does not
         have: this client knows ``job_id = keccak(owner ‖ c)`` *before* it sends,
@@ -1351,7 +1472,7 @@ class Client:
         """A handle over a job row or a post's success body.
 
         The two shapes differ: ``GET /v1/jobs/{id}`` answers a row keyed ``id``,
-        while ``POST /v1/jobs`` answers ``{job_id, task_cid, tx_hash}``. Both name
+        while ``POST /v1/jobs`` answers ``{job_id, task_cid}``. Both name
         the job, and only the row carries terms.
         """
         # `vorq.sla_secs` on a row; a post receipt carries no terms at all, so
@@ -1476,8 +1597,8 @@ class Client:
         """One batch input line: a complete sealed submission, ready to be filed.
 
         **A line is the body of ``POST /v1/jobs``**, and deliberately so — the same
-        order, the same container, the same payment authorization, read on the other side
-        by the same parser. What it does not have is the ``402`` exchange: the
+        order, the same container, the same amount, read on the other side by the
+        same parser. What it does not have is the ``402`` exchange: the
         quote is arithmetic over terms this client signed, so `cap` is computed
         here and the only things that need the network — the fees on top of it —
         are read once for the whole batch rather than once per line. The rates are
@@ -1511,35 +1632,24 @@ class Client:
             container_b64=base64.b64encode(container).decode(),
         )
 
-    def _pay_line(
-        self, line: "SealedLine", gas_fee: int, ctx: ChainContext, fee_bps: int
-    ) -> dict[str, Any]:
-        """Authorize one sealed line and render the JSONL row.
-
-        Separate from the sealing because the two need different things: sealing
-        needs a recipient key and produces the commitment the order signs, and this
-        needs the fees, which are one read for the whole batch. Split that way the
-        file is sealed **once** — a client that read the fees after sealing and
-        then re-sealed would mint a fresh seed, a fresh ``c`` and a fresh job id
-        for every line it had already paid to encrypt.
-        """
-        assert self.signer is not None
+    @staticmethod
+    def _line_amount(line: "SealedLine", gas_fee: int, fee_bps: int) -> int:
+        """What one line locks at claim: its cap, the protocol fee on it (floored as the chain floors it) and the gas fee."""
         cap = _cap(line.terms)
-        # the protocol fee rides on top of the cap, floored as the chain floors it
-        amount = cap + cap * fee_bps // 10000 + gas_fee
-        # Flat, like a single job: the order's fields, the payment and the
-        # container side by side, always inline — a line is one JSON row inside
-        # the uploaded batch input file, so there is nowhere else for its bytes to go.
+        return cap + cap * fee_bps // 10000 + gas_fee
+
+    def _pay_line(self, line: "SealedLine", amount: int, ctx: ChainContext) -> dict[str, Any]:
+        """Render one sealed line as its JSONL row, stating the ``amount`` it locks.
+
+        Flat, like a single job: the order's fields, the container and the
+        amount side by side, always inline — a line is one JSON row inside the
+        uploaded batch input file, so there is nowhere else for its bytes to go.
+        Nothing is signed here: the line is paid from the prepaid balance.
+        """
         return {
             "url": line.url,
             **line.vorq,
             "container": line.container_b64,
-            "auth_sig": self.signer.sign_payment_authorization(
-                amount=amount,
-                job_id=line.job_id,
-                expires_at=line.terms.expires_at,
-                ctx=ctx,
-            ),
             "amount": format_usd(amount, ctx.decimals),
         }
 

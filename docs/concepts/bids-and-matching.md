@@ -55,9 +55,9 @@ work is a token for text, a pixel for images and a pixel-second for video
 2. **Seal and sign.** The client seals the payload to the first candidate, names it as the
    order's designated provider, signs the order at **that provider's ask** and asks for the
    order's quote. You never pay more than the ask, and never more than a ceiling you named.
-3. **Pay and post.** The client signs a payment authorization for the quoted amount and posts
-   the order, the authorization and the sealed payload together. The payload crosses the wire
-   once.
+3. **Fund and post.** If the quote shows your balance short, the client deposits the shortfall
+   (see [Balance and deposits](./balance.md)). It then posts the order, the quoted amount and
+   the sealed payload together. The payload crosses the wire once.
 
 With `submit(..., provider=N)` the probe is pinned to provider `N`, so the only candidate is
 that provider's ask.
@@ -89,7 +89,8 @@ A resting order is paid at the rates it signed, by whichever provider claims it:
   your decision.
 - With `provider=N` it rests sealed to that provider's registered key and only that provider
   can claim it.
-- An order that expires unclaimed is refunded less the gas fee.
+- An order that expires unclaimed costs nothing: it never reached the chain, so nothing was
+  locked from your balance.
 
 The trade-off is trust scope: a matched order is readable only by the provider it was sealed
 to, while an open order is also readable by the coordinator's escrow.
@@ -105,16 +106,14 @@ amount = cap + protocol fee + gas fee
 ```
 
 `cap` is the most the job can charge for the work itself, fixed by the terms you signed. The
-protocol fee is a share of the cap, and the gas fee covers the coordinator relaying your order.
-Settlement charges the counts the job actually used (see [Cost](./units-and-cost.md#cost)) and
-refunds the rest of the cap with its share of the protocol fee.
-The quote states every amount as a USD decimal string.
+protocol fee is a share of the cap, and the gas fee covers the coordinator relaying the job.
+When a provider claims the order, `amount` is locked from your balance. Settlement charges the
+counts the job actually used (see [Cost](./units-and-cost.md#cost)) and returns the rest of the
+cap, with its share of the protocol fee, to your balance.
 
-The client derives every member of the payment authorization itself; the quote supplies only
-the amount. A quote whose authorization disagrees with the client's own derivation is refused
-before anything is signed. If the gas fee moves while you sign, the coordinator answers with a
-new quote and the client re-signs only the payment, up to three attempts, without re-sealing or
-re-uploading the payload.
-
-The payment authorization is single-use: its nonce is the job id, and only the job registry can
-execute it.
+The quote states every amount as a USD decimal string, and also carries `balance` (your
+available balance), `deposit` (`"0"` when the balance covers `amount`, otherwise the shortfall
+plus the deposit fee) and `deposit_fee`. The client refuses a quote whose non-zero `deposit` is
+not above `deposit_fee` or is above `amount + deposit_fee`. If the quote moves
+while the client posts, the coordinator answers with a new quote and the client deposits again
+if needed and re-posts, up to three attempts, without re-sealing or re-uploading the payload.

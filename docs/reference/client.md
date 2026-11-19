@@ -20,6 +20,7 @@ client = vorq.Client(
     transport: httpx.AsyncBaseTransport | None = None,
     verifier: Verifier | None = None,
     gateway: str | None = None,
+    auto_deposit: bool = True,
 )
 ```
 
@@ -38,6 +39,7 @@ raises `ValueError`.
 | `transport` | Replaces the underlying `httpx` transport: a proxy, a custom pool or a test double. |
 | `verifier` | A [`vorq.Verifier`](./verifier.md). Required to post an [open order](../concepts/bids-and-matching.md#resting-orders), including every unrestricted batch line that rests, and for `confidential=True`. |
 | `gateway` | The storage gateway result bytes are read from. See [Reading results](#reading-results). |
+| `auto_deposit` | When a submission's quote shows your balance short, deposit the shortfall before posting. `False` raises `InsufficientBalance` instead. See [Balance and deposits](../concepts/balance.md). |
 
 The client is an async context manager (`async with vorq.Client(...) as client:`); otherwise
 call `await client.aclose()`.
@@ -88,8 +90,9 @@ handle = await client.submit(
 ) -> JobHandle
 ```
 
-Seals, signs, pays for and posts one job to `POST /v1/jobs`, for any modality. The flow is
-described in [Bids and matching](../concepts/bids-and-matching.md#how-an-order-is-matched).
+Seals, signs and posts one job to `POST /v1/jobs`, for any modality, paid from your prepaid
+balance. The flow is described in
+[Bids and matching](../concepts/bids-and-matching.md#how-an-order-is-matched).
 
 ```python
 # One ceiling, no provider: never more than $1.50 per 1M input tokens.
@@ -114,7 +117,9 @@ never a rate above the ceiling on that side. Set it too low and no provider matc
 | `custom_id` | `None` | Your own label. It travels sealed and comes back as `.custom_id` on the result. |
 
 `submit` requires both a signer and a cipher and raises `ValidationError` before any request
-without them. Sealed containers up to 15,679,488 bytes are posted inline as base64; larger ones
+without them. When the quote shows the balance short, the client deposits the shortfall first
+(`POST /v1/deposits`); with `auto_deposit=False` it raises `InsufficientBalance` and posts
+nothing. Sealed containers up to 15,679,488 bytes are posted inline as base64; larger ones
 are first uploaded with `POST /v1/files` and referenced by content id.
 
 Returns a [`JobHandle`](./job-handle.md).
@@ -130,6 +135,49 @@ When the model's entry in `GET /v1/models` carries a `vorq.params_schema` (JSON 
 - A key the schema doesn't list triggers a `UserWarning` and is sent unchanged.
 
 When the model publishes no schema, or the model list can't be fetched, validation is skipped.
+
+## Balance
+
+Jobs are paid from your wallet's prepaid balance. See [Balance and deposits](../concepts/balance.md).
+Each method returns the balance body as a `dict`, money as USD decimal strings:
+
+| Key | Meaning |
+| --- | --- |
+| `owner` | Your wallet address. |
+| `balance` | What the job registry holds for you. |
+| `reserved` | What your open orders will lock when they are claimed. |
+| `available` | `balance − reserved`: what a new submission can draw on. |
+| `deposit_fee` | The flat fee taken from each deposit. |
+
+### `balance()`
+
+```python
+await client.balance() -> dict
+```
+
+`GET /v1/balance?owner=<your address>`.
+
+### `deposit()`
+
+```python
+await client.deposit(amount: str | Decimal) -> dict
+```
+
+Credits `amount` USD to your balance. The client signs one EIP-3009 authorization for `amount`
+plus `deposit_fee` and sends it to `POST /v1/deposits`; the coordinator relays it, so the deposit
+costs you no gas. `amount` must be a positive USD decimal string or `Decimal`.
+
+### `withdraw()`
+
+```python
+await client.withdraw(amount: str | Decimal) -> dict
+```
+
+Moves `amount` USD from your available balance back to your wallet. The client signs `Withdraw`
+and sends it to `POST /v1/withdrawals`; the coordinator relays it. More than `available` raises
+`StateConflictError` with `.code == "insufficient_balance"`.
+
+All three require a signer and raise `ValidationError` without one.
 
 ## `job()`
 
@@ -204,5 +252,6 @@ answer. Every failure raises `VorqError`.
 - Submissions (`POST /v1/jobs`, `POST /v1/files`, `POST /v1/batches`) are never retried on an
   error status. If the connection drops while posting a job, the client reads the job back by
   its precomputed id and re-sends only if it doesn't exist.
-- If the gas fee changes during a submission, the coordinator returns a new quote and the client
-  re-signs the payment, up to 3 attempts in total.
+- If the quote changes during a submission (the gas fee moved, or the balance no longer covers
+  the job), the coordinator returns a new quote and the client deposits again if needed and
+  re-posts, up to 3 attempts in total.

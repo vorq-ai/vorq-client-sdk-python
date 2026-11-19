@@ -19,7 +19,15 @@ from vorq._results import JobError, TextResult
 from vorq.errors import BatchFailed, EscrowKeyUnverified, ValidationError, VorqError, WaitTimeout
 
 from .conftest import fake_cid, json_keys, json_response, make_client
-from .test_client import BOX_PUBLIC, _open_complete, auth_router, escrow_verifier, quote_body
+from .test_client import (
+    BOX_PUBLIC,
+    _open_complete,
+    _recover_deposit,
+    auth_router,
+    balance_body,
+    escrow_verifier,
+    quote_body,
+)
 
 needs_wallet = pytest.mark.skipif(
     not os.environ.get("VORQ_WALLET_KEY") or not os.environ.get("VORQ_CIPHER_KEY"),
@@ -89,12 +97,13 @@ def batch_object(**over) -> dict:
 
 
 def batch_router(state, *, batch=None, files=None, blobs=None, fee_bps: int | None = 100, gas_fee="0",
-                 allocation=None):
+                 allocation=None, available="100"):
     """Everything a batch submit and drain reads, captured into ``state``.
 
     ``allocation`` is what a plan names per entry — a list, or a function of the
     entry; unset, provider 1 — or the lowest id of the entry's ``providers`` —
-    takes every line at 0.001/0.002.
+    takes every line at 0.001/0.002. ``available`` is the wallet's available
+    balance; every read and deposit is recorded in ``state["funding"]``.
     """
     files = files or {}
     blobs = blobs or {}
@@ -113,7 +122,15 @@ def batch_router(state, *, batch=None, files=None, blobs=None, fee_bps: int | No
             answer = quote_body(body, amount="0.00021", gas_fee=gas_fee, fee_bps=fee_bps)
             state.setdefault("quotes_answered", []).append(answer["quote"])
             return json_response(402, answer)
+        if path == "/v1/balance":
+            state.setdefault("funding", []).append("balance")
+            return json_response(200, balance_body(balance=available))
+        if path == "/v1/deposits":
+            state.setdefault("funding", []).append("deposit")
+            state.setdefault("deposits", []).append(json.loads(request.content))
+            return json_response(200, balance_body())
         if path == "/v1/files" and method == "POST":
+            state.setdefault("funding", []).append("upload")
             state["upload"] = request.content
             state["upload_type"] = request.headers.get("content-type", "")
             return json_response(200, {"id": "file-in", "object": "file", "purpose": "batch"})
@@ -208,12 +225,12 @@ class TestSubmit:
         assert len(lines) == 3
         assert "multipart/form-data" in state["upload_type"]
         keys = json_keys(lines)
-        # Flat, like the single-job form: nothing nested under a `vorq` or a
-        # `payment` key.
+        # Flat, like the single-job form: nothing nested under a `vorq` key, and
+        # no payment signature — every line is paid from the prepaid balance.
         assert keys == {"url", "container"} | {
             "c", "owner", "job_id", "model_id", "sla_secs", "rate_in", "rate_out",
             "units_in", "units_out", "designated", "expires_at", "signature",
-            "auth_sig", "amount",
+            "amount",
         }
         # The prompt is inside the container and nowhere else.
         assert "input" not in keys
@@ -279,7 +296,7 @@ class TestSubmit:
         assert "container" not in state["quotes"][0]
         await client.aclose()
 
-    async def test_batch_authorizations_cover_the_protocol_fee(self):
+    async def test_batch_amounts_cover_the_protocol_fee(self):
         """The fee rides on top of the cap, floored, with the gas fee beside it."""
         state = {}
         client = _sealing_client(batch_router(state, gas_fee="0.000013", fee_bps=250))
@@ -292,6 +309,41 @@ class TestSubmit:
         cap = max(1, -(-scaled // 1_000_000))
         assert cap * 250 % 10000  # this cap does not divide, so the floor is exercised
         assert parse_usd(line["amount"], 6) == cap + cap * 250 // 10000 + gas_fee
+        await client.aclose()
+
+    async def test_a_covered_balance_is_read_once_and_deposits_nothing(self):
+        state = {}
+        client = _sealing_client(batch_router(state))
+        await client.batches.submit(REQUESTS, providers=[7])
+        assert state["funding"] == ["balance", "upload"]
+        await client.aclose()
+
+    async def test_the_batch_shortfall_is_deposited_once_before_the_upload(self):
+        """The balance is checked against the whole batch, and what is short is
+        deposited in one authorization — never one per line."""
+        state = {}
+        client = _sealing_client(batch_router(state, gas_fee="0.000013", available="0.00001"))
+        await client.batches.submit(REQUESTS, providers=[7])
+        assert state["funding"] == ["balance", "deposit", "upload"]
+        total = sum(parse_usd(line["amount"], 6) for line in _uploaded_lines(state["upload"]))
+        [sent] = state["deposits"]
+        # The shortfall against `available`, plus the deposit fee.
+        assert parse_usd(sent["value"], 6) == total - parse_usd("0.00001", 6) + parse_usd("0.002", 6)
+        assert _recover_deposit(sent, client.signer.address) == client.signer.address
+        await client.aclose()
+
+    async def test_auto_deposit_off_refuses_a_short_batch_before_the_upload(self):
+        from vorq import InsufficientBalance
+
+        state = {}
+        client = _sealing_client(batch_router(state, gas_fee="0.000013", available="0.00001"),
+                                 auto_deposit=False)
+        with pytest.raises(InsufficientBalance) as exc:
+            await client.batches.submit(REQUESTS, providers=[7])
+        assert state["funding"] == ["balance"]
+        err = exc.value
+        assert err.balance == "0.00001"
+        assert Decimal(err.required) - Decimal(err.balance) == Decimal(err.shortfall)
         await client.aclose()
 
     async def test_batch_refuses_a_quote_without_fee_bps(self):

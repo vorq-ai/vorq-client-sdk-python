@@ -14,9 +14,10 @@ class Signer(Protocol):
     address: str
     def sign_order_v2(self, terms: OrderTerms, ctx: ChainContext) -> str: ...
     def sign_cancel(self, job_id: str, issued_at: int, ctx: ChainContext) -> str: ...
-    def sign_payment_authorization(
-        self, *, amount: int, job_id: str, expires_at: int, ctx: ChainContext
+    def sign_deposit_authorization(
+        self, amount: int, nonce: str, valid_before: int, ctx: ChainContext
     ) -> str: ...
+    def sign_withdraw(self, amount: int, issued_at: int, ctx: ChainContext) -> str: ...
     def sign_nonce(self, nonce: str, chain_id: int) -> str: ...
 ```
 
@@ -51,7 +52,8 @@ signer = vorq.WalletSigner.generate()        # fresh throwaway wallet
 | `.address` | The checksummed wallet address. |
 | `.sign_order_v2(terms, ctx)` | Signs `Order` on the job registry's domain. |
 | `.sign_cancel(job_id, issued_at, ctx)` | Signs `Cancel` on the same domain. |
-| `.sign_payment_authorization(amount=, job_id=, expires_at=, ctx=)` | Signs `ReceiveWithAuthorization` (EIP-3009) on the payment token's domain. |
+| `.sign_deposit_authorization(amount, nonce, valid_before, ctx)` | Signs a deposit: `ReceiveWithAuthorization` (EIP-3009) on the payment token's domain. |
+| `.sign_withdraw(amount, issued_at, ctx)` | Signs `Withdraw` on the job registry's domain. |
 | `.sign_nonce(nonce, chain_id)` | Signs the session handshake. |
 
 All signatures are 65 bytes, with `v` in {27, 28} and low `s`.
@@ -100,7 +102,8 @@ The session handshake is signed under the chain id that `GET /auth/nonce` announ
 | --- | --- | --- |
 | `Order` | `{name: "VORQ Jobs", version: "2", chainId, verifyingContract: job_registry}` | `Order(bytes32 c,uint32 modelId,uint32 slaSecs,uint128 rateIn,uint128 rateOut,uint32 unitsIn,uint32 unitsOut,uint32 designated,uint64 expiresAt)` |
 | `Cancel` | same as `Order` | `Cancel(bytes32 jobId,uint64 issuedAt)` |
-| Payment authorization | `{name, version}` from `token_domain`, `chainId`, `verifyingContract: usdc` | `ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)` |
+| `Withdraw` | same as `Order` | `Withdraw(uint128 amount,uint64 issuedAt)` |
+| Deposit authorization | `{name, version}` from `token_domain`, `chainId`, `verifyingContract: usdc` | `ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)` |
 | `VorqSession` | `{name: "VORQ Session", version: "1", chainId}`, no `verifyingContract` | `VorqSession(address address,string nonce)` |
 
 Test vectors for these types are in
@@ -115,9 +118,14 @@ Test vectors for these types are in
 - `expiresAt` is now plus the SLA window plus `VORQ_SETTLEMENT_MARGIN`, capped at 24 hours.
 - The job id is not signed; it is `keccak256(owner ‖ c)`.
 
-**Payment authorization.** `from` is your address, `to` is `job_registry`, `value` is the quoted
-USD amount as the token's atomic integer, `validAfter` is `0`, `validBefore` is `expiresAt + 1`, and `nonce` is the job id, which
-makes the authorization single-use.
+**Deposit authorization.** `from` is your address, `to` is `job_registry`, `value` is the USD
+amount deposited (including the deposit fee) as the token's atomic integer, `validAfter` is `0`,
+`validBefore` is one hour after signing, and `nonce` is 32 random bytes, which makes the
+authorization single-use. Only the job registry can execute it.
+
+**Withdraw.** `amount` is the USD amount as the token's atomic integer and `issuedAt` is unix
+seconds. The chain accepts `issuedAt` within ±600 s of its clock and only above your previous
+withdrawal's, so a withdrawal signature can't be replayed.
 
 ## Container format
 

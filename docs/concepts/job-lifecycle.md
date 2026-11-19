@@ -8,11 +8,11 @@ the result is read later, from any process that knows the job id.
 
 ## From submit to result
 
-1. **Submit.** The client seals the payload, signs the order and a payment authorization, and
-   posts them to the coordinator, which relays the order on-chain. The answer carries the job
-   id.
+1. **Submit.** The client seals the payload, signs the order, deposits any shortfall in your
+   [balance](./balance.md), and posts them to the coordinator. The answer carries the job id.
 2. **Queued.** The order waits for a provider whose ask it clears.
-3. **In progress.** A provider has claimed the job. From here it can no longer be cancelled.
+3. **In progress.** A provider has claimed the job: the claim records the order on chain and
+   locks its amount from your balance. From here it can no longer be cancelled.
 4. **Settled.** The provider delivers, seals the result to your result key, and settles. The
    job reports `completed` and names its result by a content address, `result_cid`.
 5. **Read.** `handle.result()` fetches the bytes behind `result_cid` from a storage gateway and

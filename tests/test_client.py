@@ -37,9 +37,11 @@ from vorq._money import format_usd, parse_usd
 from vorq._terms import ChainContext, order_domain
 from vorq.errors import (
     EscrowKeyUnverified,
+    InsufficientBalance,
     JobFailed,
     NotFoundError,
     ResultIntegrityError,
+    StateConflictError,
     ValidationError,
     VorqError,
     WaitTimeout,
@@ -126,6 +128,11 @@ def provider_record(provider_id: int, box_key: str = BOX_PUBLIC, **over) -> dict
     return record
 
 
+def is_complete(body: dict) -> bool:
+    """A complete submission: the one `POST /v1/jobs` body that carries the container."""
+    return "container" in body or "container_cid" in body
+
+
 def quote_body(
     body: dict,
     *,
@@ -133,20 +140,19 @@ def quote_body(
     candidates: list[dict] | None = None,
     gas_fee: str = "0",
     fee_bps: int | None = 100,
+    balance: str = "100",
+    deposit: str = "0",
+    deposit_fee: str = "0.002",
 ) -> dict:
     """The `402` body, and the `409` body when the quote goes stale — one shape.
-
-    Built from the *request*, because every member of the authorization is about
-    the order that was signed: the nonce is the job id and the window closes one
-    second past the order's own `expires_at`. A fixture that invented them would
-    let a client that ignores the quote pass.
 
     A market probe (no rates, unsigned) is answered with ``candidates`` alone:
     the given list, or the pinned provider (provider 1 when unpinned), less any
     whose ask is above a ceiling the probe names. On a
     signed challenge ``candidates`` is added only when given.
     ``fee_bps=None`` leaves it off too, which is a node that cannot be priced.
-    Money is USD strings; the authorization's ``value`` is the atomic integer signed.
+    Money is USD strings. By default the balance covers the job, so ``deposit``
+    is ``"0"``.
     """
     v = body  # flat; a form body (the 409 path) carries strings
     if is_probe(v):
@@ -159,36 +165,19 @@ def quote_body(
         **extra,
         "quote": {
             "cap": "0.00021", "gas_fee": gas_fee, "amount": amount, **fee,
-            "authorization": {
-                "domain": {"name": "USDC", "version": "2", "chainId": CHAIN["chain_id"],
-                           "verifyingContract": CHAIN["contracts"]["usdc"]},
-                "to": CHAIN["contracts"]["job_registry"],
-                "value": parse_usd(amount, 6),
-                "valid_after": 0,
-                "valid_before": int(v["expires_at"]) + 1,
-                "nonce": v["job_id"],
-            },
+            "balance": balance, "deposit": deposit, "deposit_fee": deposit_fee,
         },
-        "accepts": [{"scheme": "eip3009", "network": f"eip155:{CHAIN['chain_id']}"}],
     }
 
 
-#: An address this deployment names nowhere.
-STRANGER = "0x" + "ee" * 20
-
-
-def quote_with(body: dict, **authorization) -> dict:
-    """The honest `402` for this order, with its authorization block patched."""
-    honest = quote_body(body)
-    return {**honest, "quote": {**honest["quote"], "authorization": {
-        **honest["quote"]["authorization"], **authorization,
-    }}}
-
-
-def quote_with_domain(body: dict, **domain) -> dict:
-    """The same, patching the authorization's *domain* rather than its members."""
-    honest = quote_body(body)["quote"]["authorization"]["domain"]
-    return quote_with(body, domain={**honest, **domain})
+def balance_body(*, balance: str = "100", reserved: str = "0", available: str | None = None,
+                 deposit_fee: str = "0.002", owner: str | None = None) -> dict:
+    """`GET /v1/balance` — and the answer to a deposit or a withdrawal."""
+    return {
+        "owner": owner or WalletSigner().address, "balance": balance, "reserved": reserved,
+        "available": available if available is not None else balance,
+        "deposit_fee": deposit_fee,
+    }
 
 
 class _OpaqueSigner:
@@ -203,7 +192,10 @@ class _OpaqueSigner:
     def sign_cancel(self, job_id, issued_at, ctx) -> str:
         raise AssertionError("nothing should be signed in these tests")
 
-    def sign_payment_authorization(self, **kwargs) -> str:
+    def sign_deposit_authorization(self, amount, nonce, valid_before, ctx) -> str:
+        raise AssertionError("nothing should be signed in these tests")
+
+    def sign_withdraw(self, amount, issued_at, ctx) -> str:
         raise AssertionError("nothing should be signed in these tests")
 
     def sign_nonce(self, nonce: str, chain_id: int) -> str:
@@ -404,7 +396,7 @@ class TestSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 captured["challenge_body"] = body
                 return json_response(402, quote_body(body))
             captured["complete"] = body
@@ -433,7 +425,7 @@ class TestSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             captured["complete"] = body
             return json_response(200, queued_job(sla="24h"))
@@ -452,7 +444,7 @@ class TestSubmit:
         when it checks units_in against the payload size."""
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             return json_response(200, queued_job(sla="24h"))
 
@@ -470,7 +462,7 @@ class TestSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             captured["complete"] = body
             return json_response(200, queued_job(sla="24h"))
@@ -487,7 +479,7 @@ class TestSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 captured["challenge_body"] = body
                 return json_response(402, quote_body(body))
             captured["complete"] = body
@@ -516,7 +508,7 @@ class TestSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 challenges.append(body)
                 return json_response(402, quote_body(body))
             return json_response(200, queued_job(sla="24h"))
@@ -539,7 +531,7 @@ class TestSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 captured["terms"] = body
                 return json_response(402, quote_body(body, candidates=ranked))
             return json_response(200, queued_job(sla="24h"))
@@ -555,7 +547,7 @@ class TestSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 challenges.append(body)
                 return json_response(402, quote_body(body))
             return json_response(200, queued_job(sla="1h"))
@@ -568,12 +560,12 @@ class TestSubmit:
         assert (terms["rate_in"], terms["rate_out"], terms["designated"]) == ("0.003", "0.006", 3)
         await client.aclose()
 
-    async def test_no_rates_and_no_live_ask_raises_before_signing_a_payment(self):
+    async def test_no_rates_and_no_live_ask_raises_before_signing_anything(self):
         challenges = []
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" in body:
+            if is_complete(body):
                 raise AssertionError("nothing should be posted")
             challenges.append(body)
             return json_response(402, quote_body(body, candidates=[]))
@@ -611,7 +603,7 @@ class TestSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 captured["probe" if is_probe(body) else "challenge"] = body
                 return json_response(402, quote_body(body))
             return json_response(200, queued_job(sla="1h"))
@@ -747,7 +739,7 @@ class TestAuth:
         def jobs(request):
             seen["job_auth"] = request.headers.get("authorization")
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             return json_response(200, queued_job(sla="24h"))
 
@@ -776,7 +768,7 @@ class TestAuth:
                 return json_response(200, provider_record(1))
             seen["auth"] = request.headers.get("authorization")
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             return json_response(200, queued_job(sla="24h"))
 
@@ -803,7 +795,7 @@ class TestAuth:
             if request.method == "GET":
                 return json_response(200, queued_job(sla="24h"))
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             return json_response(200, queued_job(sla="24h"))
 
@@ -894,7 +886,7 @@ class TestAuth:
 # module — shared with TestSubmit and TestAuth, which now also exercise the
 # sealed flow (submissions are always sealed).
 
-from vorq._crypto import RECEIVE_AUTHORIZATION_TYPES, content_job_id  # noqa: E402
+from vorq._crypto import RECEIVE_AUTHORIZATION_TYPES, WITHDRAW_TYPES, content_job_id  # noqa: E402
 from vorq._terms import payment_domain  # noqa: E402
 
 
@@ -904,7 +896,7 @@ class TestEncryptedSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 captured["challenge_body"] = body
                 return json_response(402, quote_body(body))
             captured["complete_type"] = request.headers["content-type"]
@@ -956,26 +948,10 @@ class TestEncryptedSubmit:
         }
         signable = encode_typed_data(order_domain(CTX), ORDER_TYPES, message)
         assert Account.recover_message(signable, signature=vorq["signature"]) == client.signer.address
-        # The payment is one EIP-3009 authorization and an echoed amount, flat
-        # beside the terms — no authorization object the node would have to trust.
-        assert set(complete) == set(captured["challenge_body"]) | {
-            "auth_sig", "amount", "container",
-        }
+        # The job is paid from the prepaid balance: the complete body adds the
+        # container and the echoed amount it locks, and no payment signature.
+        assert set(complete) == set(captured["challenge_body"]) | {"amount", "container"}
         assert complete["amount"] == "0.00021"
-        authorization = {
-            "from": client.signer.address,
-            "to": CHAIN["contracts"]["job_registry"],
-            "value": 210,
-            "validAfter": 0,
-            "validBefore": int(vorq["expires_at"]) + 1,
-            "nonce": bytes.fromhex(vorq["job_id"][2:]),
-        }
-        signable = encode_typed_data(
-            payment_domain(CTX), RECEIVE_AUTHORIZATION_TYPES, authorization
-        )
-        assert Account.recover_message(
-            signable, signature=complete["auth_sig"]
-        ) == client.signer.address
         await client.aclose()
 
     async def test_the_expiry_is_clamped_to_the_chains_own_ceiling(self):
@@ -986,7 +962,7 @@ class TestEncryptedSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 captured["challenge_body"] = body
                 return json_response(402, quote_body(body))
             return json_response(200, queued_job(sla="24h"))
@@ -1005,7 +981,7 @@ class TestEncryptedSubmit:
         def jobs(request):
             body = req_body(request)
             posts.append(body)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             return json_response(200, queued_job(sla="24h"))
 
@@ -1024,7 +1000,7 @@ class TestEncryptedSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 captured["challenge"] = body
                 captured["challenge_type"] = request.headers["content-type"]
                 return json_response(402, quote_body(body))
@@ -1059,7 +1035,7 @@ class TestEncryptedSubmit:
                     "vorq": {"cid": captured["cid"]},
                 })
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             captured["complete"] = body
             return json_response(200, queued_job(sla="24h"))
@@ -1101,7 +1077,7 @@ class TestEncryptedSubmit:
 
         def calibrate(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             probe["container"] = body["container"]
             return json_response(200, queued_job(sla="24h"))
@@ -1124,7 +1100,7 @@ class TestEncryptedSubmit:
                         "vorq": {"cid": fake_cid(raw)},
                     })
                 body = req_body(request)
-                if "auth_sig" not in body:
+                if not is_complete(body):
                     return json_response(402, quote_body(body))
                 state["complete"] = body
                 return json_response(200, queued_job(sla="24h"))
@@ -1169,7 +1145,7 @@ class TestEncryptedSubmit:
                     "bytes": len(raw), "expires_at": 1_800_000_000, "vorq": {},
                 })
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             posts.append(body)
             return json_response(200, queued_job(sla="24h"))
@@ -1202,7 +1178,7 @@ class TestEncryptedSubmit:
                 return json_response(404, {"error": {"type": "not_found_error",
                                                      "message": "unknown job"}})
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             state["posts"] += 1
             if state["posts"] == 1:
@@ -1222,7 +1198,7 @@ class TestEncryptedSubmit:
 
     async def test_a_409_re_quote_on_an_oversized_container_uploads_only_once(self):
         """The upload is hoisted out of the re-quote loop: a `409` asking for a
-        bigger payment changes nothing about the bytes, so every attempt reuses
+        bigger amount changes nothing about the bytes, so every attempt reuses
         the `container_cid` the first (and only) upload minted."""
         state = {"uploads": 0}
         posts = []
@@ -1238,7 +1214,7 @@ class TestEncryptedSubmit:
                     "vorq": {"cid": state["cid"]},
                 })
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             posts.append(body)
             if len(posts) == 1:
@@ -1271,7 +1247,7 @@ class TestEncryptedSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             posts.append(body)
             return json_response(402, quote_body(body))  # never legitimate
@@ -1288,13 +1264,13 @@ class TestEncryptedSubmit:
 
         The two `409`s are told apart by body and never by status, so "sign this
         quote" is one code path whichever status delivered it. The container is
-        unchanged — the terms and `c` did not move, only the payment.
+        unchanged — the terms and `c` did not move, only the amount.
         """
         posts = []
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             posts.append(body)
             if len(posts) == 1:
@@ -1312,10 +1288,9 @@ class TestEncryptedSubmit:
         assert posts[0]["c"] == posts[1]["c"]
         assert posts[0]["job_id"] == posts[1]["job_id"]
         assert posts[0]["signature"] == posts[1]["signature"]
-        # Only the payment moved — and it moved to the amount the 409 quoted.
+        # Only the amount moved — to the one the 409 quoted.
         assert posts[0]["amount"] == "0.00021"
         assert posts[1]["amount"] == "0.000242"
-        assert posts[0]["auth_sig"] != posts[1]["auth_sig"]
         await client.aclose()
 
     async def test_a_409_carrying_an_error_is_raised_and_never_re_sent(self):
@@ -1323,7 +1298,7 @@ class TestEncryptedSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             posts.append(body)
             return json_response(
@@ -1352,7 +1327,7 @@ class TestEncryptedSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             posts.append(body)
             return json_response(409, quote_body(body, amount=format_usd(300 + len(posts), 6)))
@@ -1367,7 +1342,7 @@ class TestEncryptedSubmit:
     async def test_a_terms_only_200_is_refused_rather_than_short_circuited(self):
         """No server answers 200 to a terms-only body, and one that did would be wrong.
 
-        The node returns `402` unconditionally when `payment` is absent. A success
+        The node returns `402` unconditionally when the container is absent. A success
         there would mean a job posted with no container — no bytes to pin, so no
         name, which the registry refuses on chain as `EmptyTaskCid`. The old
         short-circuit accepted exactly that answer and skipped phase 2 entirely.
@@ -1391,47 +1366,34 @@ class TestEncryptedSubmit:
             await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi", sla="batch")
         await client.aclose()
 
-    # -- the quoted authorization, member for member -------------------------
-    #
-    # **This client signs what it derives; the quote supplies the amount and
-    # nothing else.** The block is still read member for member, because a node
-    # describing a different authorization than the one this client is about to
-    # sign is a node on another deployment — and signing anyway would produce an
-    # unclaimable job rather than a refusal.
+    # -- the quote's funding members ---------------------------------------
     @pytest.mark.parametrize(
-        "challenge, match",
+        "patch, match",
         [
-            pytest.param(lambda b: {"quote": {"amount": "0.00021"}},
-                         "names no amount and authorization", id="no-authorization"),
-            pytest.param(lambda b: quote_with(b, to=STRANGER),
-                         "not the one this client derives", id="another-payee"),
-            pytest.param(lambda b: quote_with_domain(b, verifyingContract=STRANGER),
-                         "not the one this client derives", id="another-token"),
-            pytest.param(lambda b: quote_with_domain(b, name="USD Coin"),
-                         "not the one this client derives", id="another-token-name"),
-            pytest.param(lambda b: quote_with(b, nonce="0x" + "cc" * 32),
-                         "not the one this client derives", id="another-jobs-nonce"),
-            pytest.param(lambda b: quote_with(b, valid_before=int(b["expires_at"]) + 2),
-                         "not the one this client derives", id="another-window"),
-            pytest.param(lambda b: quote_with(b, value=211),
-                         "not the one this client derives", id="another-value"),
-            pytest.param(lambda b: {**quote_body(b), "quote": {**quote_body(b)["quote"],
-                                                               "amount": 210}},
-                         "not a canonical USD string", id="atomic-amount"),
-            pytest.param(lambda b: quote_with(b, value="210"),
-                         "not the one this client derives", id="string-value"),
+            pytest.param({"balance": None}, "names no balance", id="no-balance"),
+            pytest.param({"deposit": None}, "names no deposit", id="no-deposit"),
+            pytest.param({"deposit_fee": None}, "names no deposit_fee", id="no-deposit-fee"),
+            pytest.param({"amount": 210}, "not a canonical USD string", id="atomic-amount"),
+            pytest.param({"deposit": "1"}, "a deposit is above its fee", id="deposit-over-amount"),
+            pytest.param({"deposit": "0.002"}, "a deposit is above its fee", id="deposit-only-the-fee"),
         ],
     )
-    async def test_a_quote_this_client_does_not_derive_is_refused(self, challenge, match):
+    async def test_a_quote_this_client_cannot_fund_is_refused(self, patch, match):
+        """A deposit is bounded by the quote itself: above its fee, at most the
+        amount plus the fee. A node asking for more is not one to sign for."""
         posts = []
 
         def jobs(request):
+            if request.url.path == "/v1/deposits":
+                posts.append({"deposit": True})
+                return json_response(200, balance_body())
             body = req_body(request)
             posts.append(body)
             if is_probe(body):
                 return json_response(402, quote_body(body))
-            if "auth_sig" not in body:
-                return json_response(402, challenge(body))
+            if not is_complete(body):
+                quote = {**quote_body(body)["quote"], **patch}
+                return json_response(402, {"quote": {k: v for k, v in quote.items() if v is not None}})
             return json_response(200, queued_job(sla="24h"))
 
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
@@ -1439,8 +1401,8 @@ class TestEncryptedSubmit:
             await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi",
                                 sla="batch", max_rate_out="0.15", provider=1)
         assert exc.value.status_code == 402
-        # The refusal is the whole point: no funded body ever went out.
-        assert not [p for p in posts if "auth_sig" in p]
+        # The refusal is the whole point: nothing was deposited or posted complete.
+        assert not [p for p in posts if "deposit" in p or is_complete(p)]
         await client.aclose()
 
     async def test_a_dropped_connection_reads_the_job_back_before_re_uploading(self):
@@ -1460,7 +1422,7 @@ class TestEncryptedSubmit:
                 state["asked"] = request.url.path
                 return json_response(200, {**queued_job(sla="24h"), "id": state["job_id"]})
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             state["posts"] += 1
             state["job_id"] = body["job_id"]
@@ -1484,7 +1446,7 @@ class TestEncryptedSubmit:
                 return json_response(404, {"error": {"type": "not_found_error",
                                                      "message": "unknown job"}})
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             state["posts"] += 1
             if state["posts"] == 1:
@@ -1514,7 +1476,7 @@ class TestEncryptedSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 challenges.append(body)
                 return json_response(402, quote_body(body, candidates=candidates))
             completes.append(body)
@@ -1552,7 +1514,7 @@ class TestEncryptedSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 challenges.append(body)
                 return json_response(402, quote_body(body))
             completes.append(body)
@@ -1578,7 +1540,7 @@ class TestEncryptedSubmit:
             if is_probe(body):
                 probes.append(body)
                 return json_response(402, quote_body(body))
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 challenges.append(body)
                 return json_response(402, quote_body(body))
             completes.append(body)
@@ -1614,7 +1576,7 @@ class TestEncryptedSubmit:
             if is_probe(body):
                 probes.append(body)
                 return json_response(402, quote_body(body))
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 challenges.append(body)
                 return json_response(402, quote_body(body))
             completes.append(body)
@@ -1653,7 +1615,7 @@ class TestEncryptedSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body, candidates=[]))
             completes.append(body)
             return json_response(200, queued_job(sla="24h"))
@@ -1684,7 +1646,7 @@ class TestEncryptedSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             captured["complete"] = body
             return json_response(200, queued_job(sla="24h"))
@@ -1816,7 +1778,7 @@ class TestEncryptedSubmit:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             return json_response(200, queued_job(sla="24h"))
 
@@ -2989,7 +2951,7 @@ class TestNoPinningSurface:
 
         def jobs(request):
             body = req_body(request)
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             captured["complete"] = body
             return json_response(
@@ -3063,17 +3025,11 @@ class TestRetiredSurfaces:
 class TestUploadFirstOperationalBounds:
     """When the bytes are filed, and what is refused before they are."""
 
-    async def test_the_container_is_filed_only_after_the_payment_is_signed(self):
+    async def test_the_container_is_filed_only_after_the_deposit(self):
         """The node deletes an upload nobody attached after 300 s, so filing the
-        bytes ahead of ``sign_payment_authorization`` spends that window on a
-        signature.
-
-        A local key signs in microseconds and would never notice. A signer that
-        prompts — a hardware wallet, a remote signing service, the browser wallet
-        the JS SDK shares this flow with — can take minutes, and an upload the
-        sweep collects makes a post the node refuses ``unknown_container`` and
-        marks not retryable. The payment does not depend on the container, so
-        signing first costs nothing and a caller who declines never uploads.
+        bytes ahead of a deposit spends that window on a signature and a relayed
+        transaction. The deposit does not depend on the container, so making it
+        first costs nothing and a caller who declines never uploads.
         """
         order: list[str] = []
 
@@ -3085,30 +3041,22 @@ class TestUploadFirstOperationalBounds:
                     {"id": "file_1", "object": "file", "purpose": "input", "bytes": 1,
                      "vorq": {"cid": "bafy-input"}},
                 )
+            if request.url.path == "/v1/deposits":
+                order.append("deposit")
+                return json_response(200, balance_body())
             body = req_body(request)
-            if "auth_sig" not in body:
-                return json_response(402, quote_body(body))
+            if not is_complete(body):
+                return json_response(402, quote_body(body, balance="0", deposit="0.00221"))
+            order.append("post")
             return json_response(200, queued_job(sla="24h"))
 
         client = Client(transport=httpx.MockTransport(auth_router(jobs)))
-        signer = client.signer
-        # `Client.signer` is optional — a read-only client has none. This test is
-        # about what the signing path does, so a missing signer is a broken
-        # fixture rather than a case to handle.
-        assert signer is not None
-        real = signer.sign_payment_authorization
-
-        def watched(**kwargs):
-            order.append("payment")
-            return real(**kwargs)
-
-        signer.sign_payment_authorization = watched  # type: ignore[method-assign]
         await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8",
                             input="x" * (INLINE_MAX_BYTES + 1024), sla="batch",
                             max_rate_out="0.15", provider=1)
         await client.aclose()
 
-        assert order == ["payment", "upload"]
+        assert order == ["deposit", "upload", "post"]
 
     async def test_the_container_is_filed_once_across_a_re_quote(self):
         """The memo must not move the upload *into* the attempt loop.
@@ -3116,8 +3064,8 @@ class TestUploadFirstOperationalBounds:
         Python's memo is the shape most likely to regress — a mutable local
         reassigned inside the loop body — so a future edit that moved
         ``content_field = None`` inside the ``for`` would re-upload on every 409
-        with nothing to catch it. A gas-fee re-quote re-signs the payment and
-        re-sends the same reference; it never re-sends the payload.
+        with nothing to catch it. A gas-fee re-quote re-sends the same reference
+        with the new amount; it never re-sends the payload.
         """
         state = {"uploads": 0, "posts": 0}
 
@@ -3131,7 +3079,7 @@ class TestUploadFirstOperationalBounds:
                 )
             body = req_body(request)
             state["posts"] += 1
-            if "auth_sig" not in body:
+            if not is_complete(body):
                 return json_response(402, quote_body(body))
             if state["posts"] == 2:
                 # The gas fee drifted: a 409 carrying a quote, which is the 402's
@@ -3175,3 +3123,265 @@ class TestUploadFirstOperationalBounds:
         assert sent["connect"] == client.timeout
         assert sent["pool"] == client.timeout
         assert client.timeout < UPLOAD_MAX_TIMEOUT_S
+
+
+def _recover_deposit(sent: dict, owner: str) -> str:
+    """The address a `POST /v1/deposits` body's authorization recovers to."""
+    message = {
+        "from": owner,
+        "to": CHAIN["contracts"]["job_registry"],
+        "value": parse_usd(sent["value"], 6),
+        "validAfter": 0,
+        "validBefore": sent["valid_before"],
+        "nonce": bytes.fromhex(sent["nonce"][2:]),
+    }
+    signable = encode_typed_data(payment_domain(CTX), RECEIVE_AUTHORIZATION_TYPES, message)
+    return Account.recover_message(signable, signature=sent["auth_sig"])
+
+
+def balance_router(seen: list, *, body: dict | None = None, jobs=None):
+    """`auth_router` plus the three balance routes, recording what each was sent."""
+
+    def handler(request):
+        path = request.url.path
+        if path == "/v1/balance":
+            seen.append(("balance", dict(request.url.params)))
+            return json_response(200, body or balance_body())
+        if path == "/v1/deposits":
+            seen.append(("deposit", req_body(request)))
+            return json_response(200, body or balance_body())
+        if path == "/v1/withdrawals":
+            seen.append(("withdraw", req_body(request)))
+            return json_response(200, body or balance_body())
+        if jobs is not None:
+            return jobs(request)
+        raise AssertionError(f"unexpected {request.method} {path}")
+
+    return auth_router(handler)
+
+
+class TestBalance:
+    """The prepaid balance: read, deposit, withdraw — every one gasless."""
+
+    async def test_balance_reads_the_wallets_own_body(self):
+        seen: list = []
+        client = Client(transport=httpx.MockTransport(balance_router(seen)))
+        body = await client.balance()
+        assert seen == [("balance", {"owner": client.signer.address})]
+        assert body == balance_body()
+        await client.aclose()
+
+    async def test_a_balance_that_is_not_usd_strings_is_the_nodes_fault(self):
+        seen: list = []
+        client = Client(transport=httpx.MockTransport(
+            balance_router(seen, body={**balance_body(), "available": 100_000_000})
+        ))
+        with pytest.raises(VorqError, match="not a canonical USD string"):
+            await client.balance()
+        await client.aclose()
+
+    async def test_a_wallet_less_client_has_no_balance_and_asks_nothing(self):
+        client = make_client(lambda r: (_ for _ in ()).throw(AssertionError(r.url.path)))
+        with pytest.raises(ValidationError, match="belongs to a wallet"):
+            await client.balance()
+        with pytest.raises(ValidationError, match="belongs to a wallet"):
+            await client.deposit("1")
+        with pytest.raises(ValidationError, match="belongs to a wallet"):
+            await client.withdraw("1")
+        await client.aclose()
+
+    async def test_deposit_signs_the_amount_plus_the_fee_into_the_job_registry(self):
+        seen: list = []
+        client = Client(transport=httpx.MockTransport(balance_router(seen)))
+        before = int(time.time())
+        body = await client.deposit("5")
+        assert body == balance_body()
+        (_, read), (_, sent) = seen
+        assert read == {"owner": client.signer.address}
+        assert set(sent) == {"owner", "value", "valid_before", "nonce", "auth_sig"}
+        assert sent["owner"] == client.signer.address
+        # The amount credited, plus the network's deposit fee: the signed value.
+        assert sent["value"] == "5.002"
+        assert before + 3600 <= sent["valid_before"] <= int(time.time()) + 3600
+        assert len(bytes.fromhex(sent["nonce"][2:])) == 32
+        assert _recover_deposit(sent, client.signer.address) == client.signer.address
+        await client.aclose()
+
+    async def test_every_deposit_draws_a_fresh_nonce(self):
+        seen: list = []
+        client = Client(transport=httpx.MockTransport(balance_router(seen)))
+        await client.deposit("1")
+        await client.deposit("1")
+        nonces = [sent["nonce"] for kind, sent in seen if kind == "deposit"]
+        assert len(nonces) == 2 and nonces[0] != nonces[1]
+        await client.aclose()
+
+    @pytest.mark.parametrize("amount", [5, 5.0, "0", "-1", "1e3", "0.0000001"])
+    async def test_a_deposit_amount_must_be_a_positive_usd_string(self, amount):
+        seen: list = []
+        client = Client(transport=httpx.MockTransport(balance_router(seen)))
+        with pytest.raises(ValidationError):
+            await client.deposit(amount)
+        assert not [s for s in seen if s[0] == "deposit"]
+        await client.aclose()
+
+    async def test_withdraw_signs_withdraw_on_the_job_registry_domain(self):
+        seen: list = []
+        client = Client(transport=httpx.MockTransport(balance_router(seen)))
+        before = int(time.time())
+        body = await client.withdraw(Decimal("1.50"))
+        assert body == balance_body()
+        [(kind, sent)] = seen
+        assert kind == "withdraw"
+        assert set(sent) == {"owner", "amount", "issued_at", "signature"}
+        assert sent["owner"] == client.signer.address
+        assert sent["amount"] == "1.5"
+        assert before <= sent["issued_at"] <= int(time.time())
+        signable = encode_typed_data(
+            order_domain(CTX), WITHDRAW_TYPES,
+            {"amount": 1_500_000, "issuedAt": sent["issued_at"]},
+        )
+        assert Account.recover_message(signable, signature=sent["signature"]) == client.signer.address
+        await client.aclose()
+
+    async def test_two_withdrawals_in_one_second_sign_strictly_later_issued_at(self, monkeypatch):
+        seen: list = []
+        client = Client(transport=httpx.MockTransport(balance_router(seen)))
+        monkeypatch.setattr(_client_module.time, "time", lambda: 1_800_000_000.25)
+        await client.withdraw("1")
+        await client.withdraw("1")
+        first, second = (sent["issued_at"] for _, sent in seen)
+        assert first == 1_800_000_000
+        assert second == first + 1
+        await client.aclose()
+
+    async def test_a_withdrawal_over_the_available_balance_is_the_nodes_refusal(self):
+        def handler(request):
+            return json_response(409, {"error": {"type": "invalid_request_error",
+                                                 "code": "insufficient_balance",
+                                                 "message": "more than available"}})
+
+        client = Client(transport=httpx.MockTransport(auth_router(handler)))
+        with pytest.raises(StateConflictError, match="more than available") as exc:
+            await client.withdraw("1000")
+        assert exc.value.status_code == 409
+        assert exc.value.code == "insufficient_balance"
+        await client.aclose()
+
+
+class TestSilentDeposit:
+    """A submission the balance does not cover deposits the quoted shortfall first."""
+
+    async def test_a_short_balance_deposits_exactly_the_quoted_value_then_posts(self):
+        seen: list = []
+        posts: list = []
+
+        def jobs(request):
+            body = req_body(request)
+            if not is_complete(body):
+                return json_response(402, quote_body(body, balance="0.0001", deposit="0.00211"))
+            posts.append(body)
+            return json_response(200, queued_job(sla="24h"))
+
+        client = Client(transport=httpx.MockTransport(balance_router(seen, jobs=jobs)))
+        await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi", sla="batch",
+                            max_rate_out="0.15", provider=1)
+        # One deposit, of exactly the quote's `deposit`, and no balance read: the
+        # quote already said what is short.
+        [(kind, sent)] = seen
+        assert kind == "deposit"
+        assert sent["value"] == "0.00211"
+        assert _recover_deposit(sent, client.signer.address) == client.signer.address
+        [complete] = posts
+        assert complete["amount"] == "0.00021"
+        await client.aclose()
+
+    async def test_a_covered_balance_deposits_nothing(self):
+        seen: list = []
+
+        def jobs(request):
+            body = req_body(request)
+            if not is_complete(body):
+                return json_response(402, quote_body(body))
+            return json_response(200, queued_job(sla="24h"))
+
+        client = Client(transport=httpx.MockTransport(balance_router(seen, jobs=jobs)))
+        await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi", sla="batch",
+                            max_rate_out="0.15", provider=1)
+        assert seen == []
+        await client.aclose()
+
+    async def test_a_409_re_quote_deposits_again_inside_the_attempt_cap(self):
+        """The balance moved between the quote and the post (another order of the
+        same wallet was claimed): the 409 quotes a fresh deposit, made with a
+        fresh nonce, and the container is reused."""
+        seen: list = []
+        posts: list = []
+
+        def jobs(request):
+            body = req_body(request)
+            if not is_complete(body):
+                return json_response(402, quote_body(body, balance="0", deposit="0.00221"))
+            posts.append(body)
+            if len(posts) == 1:
+                return json_response(409, quote_body(body, balance="0.0001", deposit="0.00211"))
+            return json_response(200, queued_job(sla="24h"))
+
+        client = Client(transport=httpx.MockTransport(balance_router(seen, jobs=jobs)))
+        await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi", sla="batch",
+                            max_rate_out="0.15", provider=1)
+        deposits = [sent for kind, sent in seen if kind == "deposit"]
+        assert [d["value"] for d in deposits] == ["0.00221", "0.00211"]
+        assert deposits[0]["nonce"] != deposits[1]["nonce"]
+        assert len(posts) == 2 and posts[0]["container"] == posts[1]["container"]
+        await client.aclose()
+
+    async def test_a_balance_that_never_covers_the_job_is_bounded(self):
+        seen: list = []
+        posts: list = []
+
+        def jobs(request):
+            body = req_body(request)
+            if not is_complete(body):
+                return json_response(402, quote_body(body, balance="0", deposit="0.00221"))
+            posts.append(body)
+            return json_response(409, quote_body(body, balance="0", deposit="0.00221"))
+
+        client = Client(transport=httpx.MockTransport(balance_router(seen, jobs=jobs)))
+        with pytest.raises(VorqError, match="re-quoted"):
+            await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi", sla="batch",
+                                max_rate_out="0.15", provider=1)
+        assert len(posts) == MAX_SUBMIT_ATTEMPTS
+        assert len([s for s in seen if s[0] == "deposit"]) == MAX_SUBMIT_ATTEMPTS
+        await client.aclose()
+
+    async def test_auto_deposit_off_raises_insufficient_balance_before_anything_is_sent(self):
+        seen: list = []
+        uploads: list = []
+
+        def jobs(request):
+            if request.url.path == "/v1/files":
+                uploads.append(1)
+                raise AssertionError("nothing should be uploaded")
+            body = req_body(request)
+            if is_complete(body):
+                raise AssertionError("nothing should be posted complete")
+            return json_response(402, quote_body(body, balance="0.0001", deposit="0.00211"))
+
+        client = Client(transport=httpx.MockTransport(balance_router(seen, jobs=jobs)),
+                        auto_deposit=False)
+        with pytest.raises(InsufficientBalance) as exc:
+            await client.submit(model="deepseek-ai/deepseek-v4-pro:fp8", input="hi", sla="batch",
+                                max_rate_out="0.15", provider=1)
+        err = exc.value
+        assert (err.balance, err.required, err.shortfall) == ("0.0001", "0.00021", "0.00011")
+        assert err.type == "insufficient_balance"
+        assert seen == [] and uploads == []
+        await client.aclose()
+
+    async def test_insufficient_balance_is_public(self):
+        import vorq
+
+        assert vorq.InsufficientBalance is InsufficientBalance
+        assert issubclass(InsufficientBalance, VorqError)
+        assert "InsufficientBalance" in vorq.__all__

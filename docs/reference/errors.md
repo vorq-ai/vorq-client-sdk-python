@@ -7,11 +7,12 @@ Every failed request or job raises a `VorqError`. Constructing a client, signer 
 no key raises `ValueError`.
 
 ```
-VorqError                     # base; .type, .status_code, .request_id
+VorqError                     # base; .type, .code, .status_code, .request_id
 ├── AuthenticationError       # 401
 ├── NotFoundError             # 404
 ├── StateConflictError        # 409
 ├── ValidationError           # 400, or a local refusal before any request
+├── InsufficientBalance       # auto_deposit=False and the balance is short; .balance, .required, .shortfall
 ├── VerificationError         # a key or attestation could not be verified
 │   └── EscrowKeyUnverified   # an open order could not be sealed; nothing was posted
 ├── ResultIntegrityError      # a result can't be read or opened (also a ValueError)
@@ -27,6 +28,7 @@ All classes are importable from `vorq`.
 | Attribute | Meaning |
 | --- | --- |
 | `.type` | The error type from the coordinator's error body, or the SDK's own type for a local error. |
+| `.code` | The `code` from the coordinator's error body, which tells refusals of one type apart, or `None`. |
 | `.status_code` | The HTTP status the error arrived with, or `None` when the SDK raised it locally. |
 | `.request_id` | The `x-request-id` correlation id. Include it in bug reports. |
 
@@ -38,9 +40,10 @@ Statuses without a subclass, such as `402`, `429` and `5xx`, raise a plain `Vorq
 | --- | --- |
 | `AuthenticationError` | The session token was rejected (a client with a signer first re-mints it once). |
 | `NotFoundError` | An unknown job, model or file. |
-| `StateConflictError` | An illegal state change, such as cancelling a claimed or ended job. |
+| `StateConflictError` | An illegal state change, such as cancelling a claimed or ended job; or a withdrawal over `available` (`.code == "insufficient_balance"`). |
 | `ValidationError` | The coordinator answered `400`; or, locally: a param that fails the model's schema, a rate that is not a USD decimal string or `Decimal`, a model missing from the catalog, invalid media inputs or `units_out`, a submission without a signer or cipher, a cancel without a signer, `confidential=True` without a verifier, or an invalid batch line. |
 | `VerificationError` | A pinned provider publishes no key, or a confidential submission found no provider it could verify. Raised before the payload is sealed. |
+| `InsufficientBalance` | A client built with `auto_deposit=False` submitted a job or batch the available balance doesn't cover. Nothing was posted. `.balance` (available), `.required` and `.shortfall` are USD decimal strings; deposit at least `.shortfall` with `client.deposit()` and resubmit. |
 | `EscrowKeyUnverified` | An open order's escrow key didn't verify, or the client has no `verifier`. Nothing was posted. Configure a verifier, pin a provider with `provider=N`, or raise the ceilings. |
 | `ResultIntegrityError` | A `completed` job names no `result_cid`; the bytes aren't a result object; the result doesn't open with this client's key; the result is sealed but no cipher is configured; or a frame isn't valid base64. |
 | `WaitTimeout` | `result()` or a batch wait reached its timeout. The job keeps running; `.job_id` is the job (or batch) id. |

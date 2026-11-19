@@ -11,7 +11,10 @@ from typing import Any
 
 
 class VorqError(Exception):
-    """Base exception. Carries the wire ``.type``, ``.status_code`` and ``.request_id``.
+    """Base exception. Carries the wire ``.type``, ``.code``, ``.status_code`` and ``.request_id``.
+
+    ``code`` is the wire ``error.code``, a discriminator inside one ``type``
+    (``"insufficient_balance"`` on a withdrawal over ``available``), or ``None``.
 
     ``status_code`` is the HTTP status the error arrived on, or ``None`` when the
     SDK raised it locally without a round trip. The class already implies the
@@ -25,11 +28,13 @@ class VorqError(Exception):
         message: str,
         *,
         type: str | None = None,
+        code: str | None = None,
         request_id: str | None = None,
         status_code: int | None = None,
     ) -> None:
         super().__init__(message)
         self.type = type
+        self.code = code
         self.request_id = request_id
         self.status_code = status_code
 
@@ -68,6 +73,31 @@ class EscrowKeyUnverified(VerificationError):
     into a fail-quiet, and the caller would never learn that the confidentiality
     it asked for was not the confidentiality it got.
     """
+
+
+class InsufficientBalance(VorqError):
+    """The prepaid balance does not cover what a submission locks.
+
+    Raised before anything is posted, by a client built with
+    ``auto_deposit=False``; with auto-deposit on, the client deposits the
+    shortfall itself. ``balance``, ``required`` and ``shortfall`` are USD
+    strings: the available balance, what the submission needs, and the
+    difference to deposit (before the deposit fee).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        balance: str,
+        required: str,
+        shortfall: str,
+        request_id: str | None = None,
+    ) -> None:
+        super().__init__(message, type="insufficient_balance", request_id=request_id)
+        self.balance = balance
+        self.required = required
+        self.shortfall = shortfall
 
 
 class ResultIntegrityError(VorqError, ValueError):
@@ -154,11 +184,14 @@ def error_from_wire(
     if isinstance(error, dict):
         message = error.get("message") or f"HTTP {status_code}"
         wire_type = error.get("type")
+        wire_code = error.get("code")
     else:
         message = f"HTTP {status_code}"
         wire_type = None
+        wire_code = None
     cls = _STATUS_MAP.get(status_code, VorqError)
-    return cls(message, type=wire_type, request_id=request_id, status_code=status_code)
+    return cls(message, type=wire_type, code=wire_code, request_id=request_id,
+               status_code=status_code)
 
 
 class BatchFailed(VorqError):

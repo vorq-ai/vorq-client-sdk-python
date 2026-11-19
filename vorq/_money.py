@@ -2,7 +2,7 @@
 
 Money on the coordinator API is a decimal USD string. An atomic token integer
 exists only where it is signed or verified — an order's ``rateIn``/``rateOut``,
-a payment authorization's ``value`` — and it is ``usd × 10^decimals``, exactly,
+a deposit authorization's ``value`` — and it is ``usd × 10^decimals``, exactly,
 with ``decimals`` the payment token's own, read from ``GET /evm/chain``.
 
 A rate is USD per 1M units of work. The chain's ``RATE_SCALE`` is 10^6 units, so

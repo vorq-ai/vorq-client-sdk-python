@@ -4,6 +4,7 @@
     "job-lifecycle",
     "bids-and-matching",
     "units-and-cost",
+    "balance",
     "encryption"
   ]
 }

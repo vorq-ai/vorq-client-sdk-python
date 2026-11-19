@@ -20,7 +20,10 @@ within its SLA window: up to 1 hour on the `async` tier, up to 24 hours on the `
   coordinator's verified escrow key when the order rests open. The result comes back sealed to a
   key derived from your wallet.
 - **Wallet authentication.** Set `VORQ_WALLET_KEY`. The client mints and rotates its session
-  token and signs every order and payment authorization on your machine.
+  token and signs every order, deposit and withdrawal on your machine.
+- **Prepaid balance.** Jobs are paid from your balance in the job registry. A submission the
+  balance doesn't cover deposits the shortfall first, with one gasless signature; or deposit and
+  withdraw yourself with `client.deposit()` and `client.withdraw()`.
 - **Batches.** `client.batches.submit()` seals each line of an OpenAI-style batch file before
   anything is uploaded.
 - **OpenAI compatibility.** `vorq.sealing_http_client()` lets the stock `openai` package use
@@ -63,7 +66,9 @@ asyncio.run(main())
 ```
 
 VORQ runs on Base: fund the wallet with USDC on Base (buy or withdraw it to the Base network,
-or bridge it). No ETH is needed.
+or bridge it). No ETH is needed: the first job deposits into your VORQ balance with a gasless
+signature, and the coordinator pays the gas. Pass `vorq.Client(auto_deposit=False)` to deposit
+only when you call `client.deposit()`; a short balance then raises `InsufficientBalance`.
 
 ## Documentation
 
@@ -76,6 +81,7 @@ Full documentation is at [docs.vorq.co/docs/python](https://docs.vorq.co/docs/py
   [the OpenAI client](https://docs.vorq.co/docs/python/guides/use-the-openai-client)
 - Concepts: [job lifecycle](https://docs.vorq.co/docs/python/concepts/job-lifecycle),
   [bids and matching](https://docs.vorq.co/docs/python/concepts/bids-and-matching),
+  [balance and deposits](https://docs.vorq.co/docs/python/concepts/balance),
   [encryption and trust](https://docs.vorq.co/docs/python/concepts/encryption)
 - Reference: [Client](https://docs.vorq.co/docs/python/reference/client),
   [errors](https://docs.vorq.co/docs/python/reference/errors),

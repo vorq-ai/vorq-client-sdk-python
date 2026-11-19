@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from .conftest import req_body
-from .test_client import CATALOG, CHAIN, provider_record, quote_body
+from .test_client import CATALOG, CHAIN, is_complete, provider_record, quote_body
 
 # Only the tests that drive the sealed transport need key material. Marking them
 # individually keeps the tests that are pure functions of their input — which
@@ -73,7 +73,7 @@ def _emulator_handler(state: dict, *, opaque: bool = False, media: bool = False)
             return httpx.Response(200, json={"echoed": json.loads(request.content)})
         if method == "POST" and path == "/v1/jobs":
             body = req_body(request)
-            if "auth_sig" not in body:      # phase 1: terms-only → 402 challenge
+            if not is_complete(body):      # phase 1: terms-only → 402 challenge
                 # A market probe names provider 3 with this emulator's key.
                 market = "rate_in" not in body and "rate_out" not in body
                 candidates = ([{"provider_id": 3, "box_key": provider_box,
@@ -1044,7 +1044,7 @@ def test_a_failed_submission_is_never_retried(wire_status):
             return httpx.Response(200, json=provider_record(3, "aa" * 32))
         if path == "/v1/jobs" and request.method == "POST":
             body = req_body(request)
-            if "auth_sig" not in body:      # phase 1: terms-only -> 402 challenge
+            if not is_complete(body):      # phase 1: terms-only -> 402 challenge
                 return httpx.Response(402, json=quote_body(body))
             submitted.append(body["job_id"])
         return httpx.Response(wire_status, json={"error": {

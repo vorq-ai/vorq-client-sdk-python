@@ -65,7 +65,8 @@ The client verifies the keys it seals to when it has a [`Verifier`](../reference
 
 ## Signatures
 
-Every signature is made locally with your wallet, under EIP-712: the order and the cancel on the
-job registry's domain, the payment authorization on the payment token's own domain, and the
+Every signature is made locally with your wallet, under EIP-712: the order, the cancel and the
+withdrawal on the job registry's domain, the deposit authorization on the payment token's own
+domain, and the
 session handshake on an off-chain domain that no contract accepts. The exact types are in
 [Signers and ciphers](../reference/signing.md#eip-712-types).

@@ -5,8 +5,9 @@ and ``SealedBoxCipher`` are the implementations the SDK ships.
 
 - ``WalletSigner`` holds the Inference Wallet Key (a secp256k1 private key) and
   produces **EIP-712** signatures. There are two worlds of them and they are
-  deliberately separate. The **chain** signatures — ``Order``, ``Cancel``, and the
-  payment token's ``ReceiveWithAuthorization`` — are verified by deployed contracts, so
+  deliberately separate. The **chain** signatures — ``Order``, ``Cancel``,
+  ``Withdraw``, and the payment token's ``ReceiveWithAuthorization`` for a deposit —
+  are verified by deployed contracts, so
   they carry a ``verifyingContract`` and belong to one deployment; that
   deployment arrives as a :class:`~vorq._terms.ChainContext` and is never
   defaulted, because a signature under the wrong one recovers to a stranger
@@ -106,6 +107,17 @@ CANCEL_TYPES: dict[str, list[dict[str, str]]] = {
     ],
 }
 
+#: ``Withdraw(uint128 amount,uint64 issuedAt)`` — the owner taking ``amount`` out
+#: of its prepaid balance, on the JobRegistry's domain. Signature-only like
+#: ``Cancel``; the chain requires ``issuedAt`` to be fresh and strictly greater
+#: than the owner's last withdrawal's, which is the replay guard.
+WITHDRAW_TYPES: dict[str, list[dict[str, str]]] = {
+    "Withdraw": [
+        {"name": "amount", "type": "uint128"},
+        {"name": "issuedAt", "type": "uint64"},
+    ],
+}
+
 #: The fixed message a wallet signs to derive its result cipher (spec D11).
 DERIVATION_MESSAGE = "VORQ-ENC-V1"
 
@@ -119,13 +131,11 @@ SESSION_TYPES: dict[str, list[dict[str, str]]] = {
     ]
 }
 
-# -- payment authorization -------------------------------------------------------
+# -- deposit authorization -------------------------------------------------------
 #
-# The escrow payment is EIP-3009 `ReceiveWithAuthorization` under the payment token's own
-# domain. Only the payee — the JobRegistry — can execute it. `nonce` is the job id, which
-# makes it single-use on the token and binds it to the one job it funds; `validBefore` is
-# `expires_at + 1` because the token requires `now < validBefore` and a claim may land
-# exactly on `expires_at`.
+# A deposit into the prepaid balance is EIP-3009 `ReceiveWithAuthorization` under the
+# payment token's own domain. Only the payee — the JobRegistry — can execute it, so the
+# client never pays gas. `nonce` is 32 random bytes, single-use on the token.
 
 RECEIVE_AUTHORIZATION_TYPES: dict[str, list[dict[str, str]]] = {
     "ReceiveWithAuthorization": [
@@ -237,9 +247,11 @@ class Signer(Protocol):
 
     def sign_cancel(self, job_id: str, issued_at: int, ctx: ChainContext) -> str: ...
 
-    def sign_payment_authorization(
-        self, *, amount: int, job_id: str, expires_at: int, ctx: ChainContext
+    def sign_deposit_authorization(
+        self, amount: int, nonce: str, valid_before: int, ctx: ChainContext
     ) -> str: ...
+
+    def sign_withdraw(self, amount: int, issued_at: int, ctx: ChainContext) -> str: ...
 
     def sign_nonce(self, nonce: str, chain_id: int) -> str: ...
 
@@ -316,13 +328,13 @@ class WalletSigner:
         message = {"jobId": to_bytes(hexstr=job_id), "issuedAt": int(issued_at)}
         return self._sign_domain(order_domain(ctx), CANCEL_TYPES, message)
 
-    def sign_payment_authorization(
-        self, *, amount: int, job_id: str, expires_at: int, ctx: "ChainContext"
+    def sign_deposit_authorization(
+        self, amount: int, nonce: str, valid_before: int, ctx: "ChainContext"
     ) -> str:
-        """Sign the escrow payment. Every member but ``amount`` comes from the order and the context.
+        """Sign a deposit of ``amount`` atomic units into this wallet's prepaid balance.
 
-        ``amount`` is the quote's — ``cap + fee + gas_fee`` — and is what the
-        JobRegistry pulls at claim. The payee is the context's own
+        ``nonce`` is a ``0x`` 32-byte hex the caller draws at random;
+        ``valid_before`` is unix seconds. The payee is the context's own
         ``job_registry`` and only that payee can execute the authorization, so a
         signature that leaked authorizes nobody else.
         """
@@ -331,10 +343,19 @@ class WalletSigner:
             "to": ctx.job_registry,
             "value": int(amount),
             "validAfter": 0,
-            "validBefore": int(expires_at) + 1,
-            "nonce": to_bytes(hexstr=job_id),
+            "validBefore": int(valid_before),
+            "nonce": to_bytes(hexstr=nonce),
         }
         return self._sign_domain(payment_domain(ctx), RECEIVE_AUTHORIZATION_TYPES, message)
+
+    def sign_withdraw(self, amount: int, issued_at: int, ctx: "ChainContext") -> str:
+        """Sign ``Withdraw(amount, issuedAt)`` on the JobRegistry's domain.
+
+        ``amount`` is atomic; ``issued_at`` is unix seconds, bounded by the chain
+        to ±600 s and strictly above this owner's last withdrawal.
+        """
+        message = {"amount": int(amount), "issuedAt": int(issued_at)}
+        return self._sign_domain(order_domain(ctx), WITHDRAW_TYPES, message)
 
     def sign_nonce(self, nonce: str, chain_id: int) -> str:
         """Sign a session-handshake nonce under the deployment's chain; returns a 0x EIP-712 signature."""

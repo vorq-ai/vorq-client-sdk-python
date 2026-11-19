@@ -14,8 +14,8 @@ Pass any object that implements the [`Signer`](../reference/signing.md#signer) p
 client = vorq.Client(signer=my_kms_signer, cipher=vorq.SealedBoxCipher())
 ```
 
-The signer is the root credential: it signs the session handshake, orders, payment
-authorizations and cancels. A custom signer can't derive the result key, so also pass a
+The signer is the root credential: it signs the session handshake, orders, deposits,
+withdrawals and cancels. A custom signer can't derive the result key, so also pass a
 `cipher=`, or set `VORQ_CIPHER_KEY`, which such a client reads automatically. Without a cipher,
 `submit` raises `ValidationError`.
 

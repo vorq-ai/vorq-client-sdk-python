@@ -160,20 +160,18 @@ class JobHandle:
         return result_from_raw(raw, job, cipher=self._cipher)
 
     async def _cancel_request(self) -> "httpx.Response":
-        """Sign ``Cancel(jobId, issuedAt)`` and relay it. Returns the node's answer.
+        """Sign ``Cancel(jobId, issuedAt)`` and send it. Returns the node's answer.
 
-        The cancel is a **chain op the node relays**, not a state change the node
-        decides. ``JobRegistry.cancel(jobId, issuedAt, signature)`` never reads
-        ``msg.sender`` and there is no ``cancelFor``, so this signature is the
-        entire authority over ending the job — which is exactly why it is made
-        here and not there. A relaying node that could author one could cancel
-        any job that ever passed through it.
+        An open order rests with the node until a provider claims it, so the
+        node ends it: it accepts the cancel only when this signature recovers to
+        the order's owner, and the same signature is what
+        ``JobRegistry.cancel(owner, c, issuedAt, signature)`` accepts on chain.
+        The owner's signature is the whole authority over ending the order.
 
-        ``issued_at`` is unix seconds, stamped now and sent on the body: the
-        chain bounds it to ±600 s of landing, so it has to be the value that was
-        signed rather than one the relay picks. There is no nonce — a cancelled
-        job cannot be cancelled twice, so the job's one-shot state machine is the
-        replay guard.
+        ``issued_at`` is unix seconds, stamped now and sent on the body: it must
+        be within ±600 s of the node's clock, so it has to be the value that was
+        signed. There is no nonce — a cancelled order cannot be cancelled twice,
+        so the order's one-shot state machine is the replay guard.
 
         A client with no wallet cannot author this at all, and it says so before
         the request rather than letting the node answer ``400`` to a body with no
@@ -201,8 +199,8 @@ class JobHandle:
     async def cancel(self) -> None:
         """Cancel the job: sign ``Cancel`` and post it to ``/v1/jobs/{id}/cancel``.
 
-        Requires the owning wallet. The node relays the signature to the chain
-        and answers with the relay receipt; a job a provider has already claimed
-        is refused there, as a :class:`~vorq.errors.StateConflictError`.
+        Requires the owning wallet. The node ends the open order and answers
+        ``{job_id}``; a job a provider has already claimed is refused, as a
+        :class:`~vorq.errors.StateConflictError`.
         """
         await self._cancel_request()

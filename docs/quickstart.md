@@ -4,8 +4,8 @@ description: Install the vorq package, set your wallet key and run your first te
 ---
 
 > **VORQ runs on Base.** Jobs are paid in USDC on Base. Fund your wallet before step 3: buy or
-> withdraw USDC to the Base network, or bridge it. No ETH is needed: the coordinator pays the
-> gas.
+> withdraw USDC to the Base network, or bridge it. No ETH is needed: deposits into your VORQ
+> balance are gasless, and the coordinator pays the gas.
 
 This page takes you from an empty environment to a finished text job.
 
@@ -27,7 +27,7 @@ Use a **dedicated wallet funded with your inference budget, never a main wallet'
 the only key you configure. On your machine, the client uses it to:
 
 - sign the session handshake, then mint and rotate the session token;
-- sign every order, payment authorization and cancel;
+- sign every order, deposit, withdrawal and cancel;
 - derive the key your results come back sealed to.
 
 ## 3. Submit a job and read the result

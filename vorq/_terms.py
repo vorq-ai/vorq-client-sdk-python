@@ -109,7 +109,7 @@ class ChainContext:
     usdc: str
     #: The payment token's own decimals: a USD amount is ``atomic / 10**decimals``.
     decimals: int
-    #: The token's EIP-712 name and version, which the payment is signed under.
+    #: The token's EIP-712 name and version, which a deposit is signed under.
     token_domain: TokenDomain
 
     @classmethod
@@ -161,7 +161,7 @@ class ChainContext:
 
 
 def order_domain(ctx: ChainContext) -> dict[str, Any]:
-    """The JobRegistry's EIP-712 domain — ``Order`` and ``Cancel`` both live here."""
+    """The JobRegistry's EIP-712 domain — ``Order``, ``Cancel`` and ``Withdraw`` live here."""
     return {
         "name": ORDER_DOMAIN_NAME,
         "version": ORDER_DOMAIN_VERSION,

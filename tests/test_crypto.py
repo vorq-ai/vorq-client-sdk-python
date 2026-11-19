@@ -113,10 +113,6 @@ def _minimal_sealed_body(signer: WalletSigner, *, box_key: str = RECIPIENT_PUBLI
             decimals=CTX.decimals,
         ),
         "container": base64.b64encode(container).decode(),
-        "auth_sig": signer.sign_payment_authorization(
-            amount=210, job_id=content_job_id(signer.address, c),
-            expires_at=terms.expires_at, ctx=CTX,
-        ),
         "amount": format_usd(210, CTX.decimals),
     }
 
@@ -245,9 +241,10 @@ class TestWalletSigner:
         signatures = {
             "Order": signer.sign_order_v2(terms, CTX),
             "Cancel": signer.sign_cancel(job_id, 1_700_000_000, CTX),
-            "payment authorization": signer.sign_payment_authorization(
-                amount=210, job_id=job_id, expires_at=terms.expires_at, ctx=CTX
+            "deposit authorization": signer.sign_deposit_authorization(
+                210, job_id, terms.expires_at, CTX
             ),
+            "Withdraw": signer.sign_withdraw(210, 1_700_000_000, CTX),
             "session nonce": signer.sign_nonce("n1", CTX.chain_id),
         }
 
@@ -423,11 +420,11 @@ class TestSealedOrderBody:
         body = _minimal_sealed_body(WalletSigner.generate())
         assert "input" not in body
         assert isinstance(body["container"], str)
-        # Flat: the order's fields, the container and the payment side by side.
+        # Flat: the order's fields, the container and the amount side by side.
         assert set(body) == {
             "c", "owner", "job_id", "model_id", "sla_secs", "rate_in", "rate_out",
             "units_in", "units_out", "designated", "expires_at", "signature",
-            "container", "auth_sig", "amount",
+            "container", "amount",
         }
         keys = set(body)
         assert not [k for k in keys if "dek" in k.lower() or "cid" in k.lower()]

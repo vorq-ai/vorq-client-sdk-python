@@ -2,10 +2,10 @@
 
 A batch fans many requests out at once, and **every line is sealed before
 anything is uploaded**. Each line is a complete submission — the same order, the
-same container v1, the same payment authorization that ``POST /v1/jobs`` takes — so the
-file the coordinator receives carries routing terms and ciphertext and nothing a
-reader could act on. The coordinator splits it, files each container, and lands
-the lines on chain in as few transactions as the block will take.
+same container v1, the same amount that ``POST /v1/jobs`` takes — so the file the
+coordinator receives carries routing terms and ciphertext and nothing a reader
+could act on. Every line is paid from the wallet's prepaid balance, which is
+topped up once, before the upload, when it does not cover the whole batch.
 
 That is the whole answer to the design gap batches were gated on: the JSONL is no
 longer a payload the node keeps, it is a file of sealed envelopes it pins like
@@ -138,7 +138,7 @@ class Batches:
         metadata: dict[str, str] | None = None,
         validate_params: bool = True,
     ) -> "BatchHandle":
-        """Seal, sign, pay and upload every line, then create the batch.
+        """Seal and sign every line, fund the balance, upload, then create the batch.
 
         ``requests`` is a list of OpenAI batch request lines (``{"custom_id",
         "method", "url", "body": {"model", ...}}``) or a path to such a JSONL
@@ -180,6 +180,11 @@ class Batches:
         One network round trip prices the whole batch: the fees on top of the cap
         are read once, from the ``402`` quote for the first line's own order, and
         every line's cap is computed locally from the rates and unit counts it signs.
+
+        The lines are paid from the prepaid balance. When ``available`` does not
+        cover the batch total, the shortfall is deposited **once** before the
+        upload; a client built with ``auto_deposit=False`` raises
+        :class:`~vorq.errors.InsufficientBalance` instead, with nothing uploaded.
         """
         window = normalize_sla(completion_window)
         client = self._client
@@ -303,8 +308,13 @@ class Batches:
 
         # -- one quote for the whole batch -----------------------------------
         gas_fee, fee_bps = await self._fees(sealed[0], ctx.decimals)
+        amounts = [client._line_amount(line, gas_fee, fee_bps) for line in sealed]
+        await client._cover(sum(amounts), ctx)
         content = (
-            "\n".join(json.dumps(client._pay_line(line, gas_fee, ctx, fee_bps)) for line in sealed)
+            "\n".join(
+                json.dumps(client._pay_line(line, amount, ctx))
+                for line, amount in zip(sealed, amounts)
+            )
             + "\n"
         ).encode("utf-8")
 
@@ -489,7 +499,7 @@ class Batches:
         return [picks[i] for i in range(len(lines))]
 
     async def _fees(self, line: "SealedLine", decimals: int) -> tuple[int, int]:
-        """What every line's payment has to cover beyond its cap, read once: the atomic gas fee and ``fee_bps``.
+        """What every line's amount has to cover beyond its cap, read once: the atomic gas fee and ``fee_bps``.
 
         A terms-only ``POST /v1/jobs`` is stateless and posts nothing — it is the
         challenge half of the single-job exchange — so asking it costs one request
@@ -516,7 +526,7 @@ class Batches:
         if not isinstance(quote, dict) or "gas_fee" not in quote:
             raise VorqError(
                 "the quote carries no gas_fee, so this batch cannot compute what each "
-                "line's payment has to cover",
+                "line's amount has to cover",
                 type="api_error",
                 status_code=402,
             )
@@ -524,7 +534,7 @@ class Batches:
         if isinstance(fee_bps, bool) or not isinstance(fee_bps, int) or not 0 <= fee_bps <= 1000:
             raise VorqError(
                 "the quote carries no fee_bps, so this batch cannot compute what each "
-                "line's payment has to cover",
+                "line's amount has to cover",
                 type="api_error",
                 status_code=402,
             )

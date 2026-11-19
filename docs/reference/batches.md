@@ -56,9 +56,12 @@ rate, the cheapest live ask's, read by one more plan. If lines with no ceiling a
 fit in the window, or there is no live ask to take a market rate from, `ValidationError` is
 raised and nothing is signed.
 
-Then every line is sealed, signed and paid for in your process. The fees on top of each line's
-cap are read once, from one quote. The file is uploaded (`POST /v1/files`, `purpose=batch`) and
-the batch created (`POST /v1/batches`).
+Then every line is sealed and signed in your process. The fees on top of each line's cap are
+read once, from one quote, and each line states the `amount` it locks. Every line is paid from
+your prepaid balance: the client reads it once (`GET /v1/balance`) and, when `available` doesn't
+cover the batch total, deposits the shortfall in one authorization before the upload. With
+`auto_deposit=False` it raises `InsufficientBalance` instead and uploads nothing. The file is
+uploaded (`POST /v1/files`, `purpose=batch`) and the batch created (`POST /v1/batches`).
 
 ## `batches.get()`
 
